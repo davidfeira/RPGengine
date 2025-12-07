@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo $OPENAI_API_KEY)",
+      "Bash(python -m venv:*)",
+      "Bash(venvScriptspip.exe install -r requirements.txt)",
+      "Bash(./venv/Scripts/pip.exe install:*)",
+      "Bash(c:\\Users\\david\\projects\\RPGengine\\venv\\Scripts\\python.exe:*)",
+      "Bash(powershell -Command:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

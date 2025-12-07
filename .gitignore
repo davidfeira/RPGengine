@@ -1,0 +1,16 @@
+# Logs
+*.log
+
+# Virtual environment
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# Game state (CLI persistence)
+.game_state.pkl

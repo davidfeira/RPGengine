@@ -1,0 +1,247 @@
+"""
+Headless RPG Game Engine - No I/O, pure game logic.
+Can be used by UI, CLI, or Claude for testing.
+"""
+
+import random
+import json
+import os
+from openai import OpenAI
+from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+
+def roll_check(stat_value: int, difficulty: int) -> tuple[bool, int]:
+    """Roll 1d10 + stat - difficulty > 5 = success"""
+    roll = random.randint(1, 10)
+    result = roll + stat_value - difficulty
+    return result > 5, roll
+
+
+def call_llm(prompt: str, system: str = None, json_mode: bool = False) -> str:
+    """Call OpenAI API"""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    kwargs = {"model": "gpt-4o-mini", "messages": messages}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content
+
+
+def interpret_action(action: str, context: str) -> dict:
+    """Use LLM to determine stat and difficulty for an action"""
+    prompt = f"Context: {context}\n\nPlayer action: {action}"
+    response = call_llm(prompt, system=INTERPRETER_PROMPT, json_mode=True)
+
+    try:
+        result = json.loads(response)
+        if not result.get("valid", True):
+            return {"valid": False, "reason": result.get("reason", "That's not possible.")}
+        if result.get("stat") not in ["mind", "body", "spirit"]:
+            result["stat"] = "body"
+        result["difficulty"] = max(1, min(5, int(result.get("difficulty", 3))))
+        result["lethal"] = result.get("lethal", False)
+        result["valid"] = True
+        return result
+    except:
+        return {"valid": True, "stat": "body", "difficulty": 3, "lethal": False}
+
+
+def narrate(context: str, character: str, stats: dict, action: str,
+            stat: str, difficulty: int, success: bool, died: bool = False,
+            forced: bool = False) -> str:
+    """Generate narrative for the outcome"""
+    if died:
+        outcome = "DEATH"
+        special_note = "THIS IS A DEATH SCENE. The character dies here."
+    elif forced and success:
+        outcome = "MIRACULOUS"
+        special_note = "THIS WAS A FORCED IMPOSSIBLE ACTION THAT SUCCEEDED. Reality bent to the character's will."
+    elif forced and not success:
+        outcome = "FAILURE"
+        special_note = "The character attempted the impossible and failed."
+    else:
+        outcome = "SUCCESS" if success else "FAILURE"
+        special_note = ""
+
+    prompt = NARRATOR_PROMPT.format(
+        context=context,
+        character=character,
+        mind=stats["mind"],
+        body=stats["body"],
+        spirit=stats["spirit"],
+        action=action,
+        stat=stat,
+        difficulty=difficulty,
+        outcome=outcome,
+        special_note=special_note
+    )
+    return call_llm(prompt)
+
+
+STORY_TONES = [
+    "mystery",
+    "adventure",
+    "drama",
+    "comedy",
+    "romance",
+    "horror",
+    "slice of life",
+]
+
+
+def opening_scene(character: str, stats: dict) -> str:
+    """Generate the opening scene with a random tone."""
+    tone = random.choice(STORY_TONES)
+    prompt = SETUP_PROMPT.format(
+        character=character,
+        mind=stats["mind"],
+        body=stats["body"],
+        spirit=stats["spirit"],
+        tone=tone
+    )
+    return call_llm(prompt)
+
+
+class RPGGame:
+    """Headless RPG game engine - no I/O, all state accessible."""
+
+    def __init__(self):
+        self.character = None
+        self.stats = None
+        self.context = ""
+        self.alive = True
+        self.history = []  # List of (context, roll_info) tuples
+        self.last_roll = None
+        self.last_action = None
+        self.last_invalid = False
+
+    def start(self, character: str, mind: int, body: int, spirit: int) -> dict:
+        """Initialize game with character. Returns opening narrative."""
+        # Validate stats
+        if not (1 <= mind <= 5 and 1 <= body <= 5 and 1 <= spirit <= 5):
+            return {"error": "Each stat must be between 1 and 5"}
+        if mind + body + spirit != 9:
+            return {"error": f"Stats must total 9, got {mind + body + spirit}"}
+
+        self.character = character
+        self.stats = {"mind": mind, "body": body, "spirit": spirit}
+        self.context = opening_scene(character, self.stats)
+        self.alive = True
+        self.history = []
+        self.last_roll = None
+
+        return {
+            "status": "started",
+            "character": self.character,
+            "stats": self.stats,
+            "narrative": self.context
+        }
+
+    def take_action(self, action: str, force: bool = False, god_mode: bool = False) -> dict:
+        """Execute a player action. Returns result with roll info and new narrative."""
+        if not self.alive:
+            return {"error": "Game over - character is dead"}
+        if not self.character:
+            return {"error": "Game not started - call start() first"}
+
+        # Handle force mode
+        if force and self.last_action and self.last_invalid:
+            action = self.last_action
+            interpretation = {"valid": True, "stat": "spirit", "difficulty": 5, "lethal": False}
+        elif god_mode:
+            interpretation = {"valid": True, "stat": "spirit", "difficulty": 1, "lethal": False}
+        else:
+            interpretation = interpret_action(action, self.context)
+
+        # Check if action is valid
+        if not interpretation.get("valid", True):
+            reason = interpretation.get("reason", "That's not possible.")
+            self.last_action = action
+            self.last_invalid = True
+            return {
+                "status": "invalid",
+                "reason": reason,
+                "action": action
+            }
+
+        self.last_invalid = False
+
+        stat = interpretation["stat"]
+        difficulty = interpretation["difficulty"]
+        lethal = interpretation.get("lethal", False)
+        stat_value = self.stats[stat]
+
+        # Save state for undo
+        self.history.append((self.context, self.last_roll))
+
+        # Roll the dice
+        if god_mode:
+            success, roll = True, 10
+        else:
+            success, roll = roll_check(stat_value, difficulty)
+
+        died = lethal and not success
+        total = roll + stat_value - difficulty
+
+        self.last_roll = {
+            "action": action,
+            "stat": stat,
+            "stat_value": stat_value,
+            "difficulty": difficulty,
+            "lethal": lethal,
+            "roll": roll,
+            "total": total,
+            "success": success,
+            "died": died,
+            "forced": force,
+            "miraculous": (force or god_mode) and success
+        }
+
+        # Narrate the outcome
+        is_miraculous = force or god_mode
+        self.context = narrate(
+            self.context, self.character, self.stats,
+            action, stat, difficulty, success, died, is_miraculous
+        )
+
+        if died:
+            self.alive = False
+
+        return {
+            "status": "death" if died else ("success" if success else "failure"),
+            "roll": self.last_roll,
+            "narrative": self.context
+        }
+
+    def get_state(self) -> dict:
+        """Return current game state for inspection."""
+        return {
+            "character": self.character,
+            "stats": self.stats,
+            "alive": self.alive,
+            "narrative": self.context,
+            "last_roll": self.last_roll,
+            "can_undo": len(self.history) > 0,
+            "can_force": self.last_invalid and self.last_action is not None
+        }
+
+    def undo(self) -> dict:
+        """Undo the last action. Returns previous state."""
+        if not self.history:
+            return {"error": "Nothing to undo"}
+
+        self.context, self.last_roll = self.history.pop()
+        self.alive = True  # Resurrect if we undo a death
+
+        return {
+            "status": "undone",
+            "narrative": self.context,
+            "last_roll": self.last_roll
+        }
