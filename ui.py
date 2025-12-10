@@ -217,6 +217,14 @@ class RPGApp(App):
         color: #e0e0e0;
     }
 
+    .player-action {
+        width: 100%;
+        text-align: right;
+        color: #0af;
+        text-style: italic;
+        margin: 1 0;
+    }
+
     #roll-bar {
         height: auto;
         min-height: 1;
@@ -932,6 +940,11 @@ class RPGApp(App):
 
         # Save state for undo
         self.history.append((self.context, self.last_roll_text))
+
+        # === DISPLAY PLAYER ACTION ===
+        # Show the player's action as a chat bubble on the right
+        story.update(f"{self.context}\n\n[dim italic right]> {action}[/]")
+        self.scroll_story()
 
         stat_value = self.stats[stat]
         stat_color = STAT_COLORS.get(stat, "#fff")
