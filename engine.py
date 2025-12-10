@@ -7,7 +7,7 @@ import random
 import json
 import os
 from openai import OpenAI
-from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT
+from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -85,28 +85,32 @@ def narrate(context: str, character: str, stats: dict, action: str,
     return call_llm(prompt)
 
 
-STORY_TONES = [
-    "mystery",
-    "adventure",
-    "drama",
-    "comedy",
-    "romance",
-    "horror",
-    "slice of life",
-]
-
-
 def opening_scene(character: str, stats: dict) -> str:
-    """Generate the opening scene with a random tone."""
-    tone = random.choice(STORY_TONES)
+    """Generate the opening scene. Tone is inferred from character concept."""
     prompt = SETUP_PROMPT.format(
         character=character,
         mind=stats["mind"],
         body=stats["body"],
-        spirit=stats["spirit"],
-        tone=tone
+        spirit=stats["spirit"]
     )
     return call_llm(prompt)
+
+
+def generate_suggestions(character: str, narrative: str) -> list[str]:
+    """Generate 3 action suggestions for the current situation."""
+    prompt = SUGGESTIONS_PROMPT.format(
+        character=character,
+        narrative=narrative
+    )
+    response = call_llm(prompt, json_mode=True)
+
+    try:
+        suggestions = json.loads(response)
+        if isinstance(suggestions, list) and len(suggestions) == 3:
+            return suggestions
+        return ["Continue forward", "Look around carefully", "Wait and observe"]
+    except:
+        return ["Continue forward", "Look around carefully", "Wait and observe"]
 
 
 class RPGGame:
@@ -122,7 +126,7 @@ class RPGGame:
         self.last_action = None
         self.last_invalid = False
 
-    def start(self, character: str, mind: int, body: int, spirit: int) -> dict:
+    def start(self, character: str, mind: int, body: int, spirit: int, with_suggestions: bool = False) -> dict:
         """Initialize game with character. Returns opening narrative."""
         # Validate stats
         if not (1 <= mind <= 5 and 1 <= body <= 5 and 1 <= spirit <= 5):
@@ -137,14 +141,19 @@ class RPGGame:
         self.history = []
         self.last_roll = None
 
-        return {
+        result = {
             "status": "started",
             "character": self.character,
             "stats": self.stats,
             "narrative": self.context
         }
 
-    def take_action(self, action: str, force: bool = False, god_mode: bool = False) -> dict:
+        if with_suggestions:
+            result["suggestions"] = generate_suggestions(self.character, self.context)
+
+        return result
+
+    def take_action(self, action: str, force: bool = False, god_mode: bool = False, with_suggestions: bool = False) -> dict:
         """Execute a player action. Returns result with roll info and new narrative."""
         if not self.alive:
             return {"error": "Game over - character is dead"}
@@ -214,11 +223,16 @@ class RPGGame:
         if died:
             self.alive = False
 
-        return {
+        result = {
             "status": "death" if died else ("success" if success else "failure"),
             "roll": self.last_roll,
             "narrative": self.context
         }
+
+        if with_suggestions and self.alive:
+            result["suggestions"] = generate_suggestions(self.character, self.context)
+
+        return result
 
     def get_state(self) -> dict:
         """Return current game state for inspection."""

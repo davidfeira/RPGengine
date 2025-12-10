@@ -10,7 +10,7 @@ import os
 import logging
 import asyncio
 from openai import OpenAI
-from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT
+from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
 from tts import get_tts
 
 STAT_COLORS = {"mind": "#0af", "body": "#fa0", "spirit": "#f0a"}
@@ -130,13 +130,34 @@ STORY_TONES = [
 
 
 def opening_scene(character: str, stats: dict) -> str:
-    tone = random.choice(STORY_TONES)
     prompt = SETUP_PROMPT.format(
         character=character,
-        mind=stats["mind"], body=stats["body"], spirit=stats["spirit"],
-        tone=tone
+        mind=stats["mind"], body=stats["body"], spirit=stats["spirit"]
     )
     return call_llm(prompt)
+
+
+def generate_suggestions(character: str, narrative: str) -> list[str]:
+    """Generate 3 action suggestions for the current situation."""
+    prompt = SUGGESTIONS_PROMPT.format(
+        character=character,
+        narrative=narrative
+    )
+
+    try:
+        response = call_llm(prompt, json_mode=True)
+        logger.debug(f"Suggestions response: {response}")
+
+        suggestions = json.loads(response)
+        if isinstance(suggestions, list) and len(suggestions) == 3:
+            logger.info(f"Generated suggestions: {suggestions}")
+            return suggestions
+
+        logger.warning(f"Invalid suggestions format: {suggestions}")
+        return ["Continue forward", "Look around carefully", "Wait and observe"]
+    except Exception as e:
+        logger.error(f"Failed to generate suggestions: {e}")
+        return ["Continue forward", "Look around carefully", "Wait and observe"]
 
 
 IDENTITY_PROMPTS = [
@@ -211,6 +232,32 @@ class RPGApp(App):
 
     #action-input:focus {
         border: round #0f9;
+    }
+
+    .suggestion-btn {
+        width: 1fr;
+        min-width: 20;
+        height: 3;
+        margin-left: 1;
+        background: #0f0f23;
+        border: round #444;
+        color: #888;
+        text-align: left;
+        padding: 0 1;
+        overflow-x: auto;
+        text-overflow: ellipsis;
+    }
+
+    .suggestion-btn:hover {
+        background: #16213e;
+        border: round #0af;
+        color: #0af;
+    }
+
+    .suggestion-btn:focus {
+        background: #16213e;
+        border: round #0f9;
+        color: #0f9;
     }
 
     Button {
@@ -504,6 +551,8 @@ class RPGApp(App):
         Binding("ctrl+z", "undo", "Undo"),
         Binding("ctrl+t", "toggle_tts", "Toggle TTS"),
         Binding("escape", "quit", "Quit"),
+        Binding("ctrl+left", "focus_previous", "Previous", show=False),
+        Binding("ctrl+right", "focus_next", "Next", show=False),
     ]
 
     TITLE = "Universal RPG Engine"
@@ -525,6 +574,7 @@ class RPGApp(App):
         self.alive = True
         self.game_started = False
         self._prompt_animation_task = None
+        self.suggestions = ["...", "...", "..."]  # Current action suggestions
 
         # Initialize TTS (enabled by default)
         get_tts().set_enabled(True)
@@ -607,11 +657,14 @@ class RPGApp(App):
             Static("", id="roll-bar"),
             Horizontal(
                 Input(placeholder="What do you do?", id="action-input"),
+                Button("...", id="suggestion-1", classes="suggestion-btn"),
+                Button("...", id="suggestion-2", classes="suggestion-btn"),
+                Button("...", id="suggestion-3", classes="suggestion-btn"),
                 Button("Undo", id="undo-btn"),
                 Button("Force!", id="force-btn", classes="hidden"),
                 Horizontal(
                     Button("◀", id="tts-slower"),
-                    Static("175", id="tts-speed"),
+                    Static("200", id="tts-speed"),
                     Button("▶", id="tts-faster"),
                     Button("🎤", id="tts-voice"),
                     id="tts-controls"
@@ -700,6 +753,16 @@ class RPGApp(App):
             f"[#f0a]Spirit[/] {self.stats['spirit']}"
         )
 
+    def update_suggestions(self, suggestions: list[str]) -> None:
+        """Update the suggestion buttons with new text."""
+        self.suggestions = suggestions
+        for i, suggestion in enumerate(suggestions, 1):
+            try:
+                btn = self.query_one(f"#suggestion-{i}", Button)
+                btn.label = suggestion
+            except:
+                pass
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         action = event.value.strip()
         if not action:
@@ -772,8 +835,13 @@ class RPGApp(App):
         story.update(self.context)
         self.scroll_story()
 
-        # Speak the opening scene (non-blocking)
-        get_tts().speak(self.context, blocking=False)
+        # Generate initial suggestions
+        suggestions = generate_suggestions(self.character, self.context)
+        self.update_suggestions(suggestions)
+
+        # Speak the opening scene (non-blocking, will be interrupted by first action)
+        tts = get_tts()
+        tts.speak(self.context, blocking=False, interrupt=True)
 
         # Focus the action input
         self.query_one("#action-input", Input).focus()
@@ -788,9 +856,6 @@ class RPGApp(App):
         force_btn = self.query_one("#force-btn", Button)
         input_widget = self.query_one("#action-input", Input)
         input_widget.disabled = True
-
-        # Stop any ongoing TTS when taking a new action
-        get_tts().stop()
 
         god_mode = False
         if action.lower().startswith("/god "):
@@ -884,12 +949,17 @@ class RPGApp(App):
         story.update(self.context)
         self.scroll_story()
 
-        # Speak the narrative (non-blocking)
-        get_tts().speak(self.context, blocking=False)
+        # Speak the narrative (non-blocking, interrupt any old speech)
+        tts = get_tts()
+        tts.speak(self.context, blocking=False, interrupt=True)
 
         if died:
             self.alive = False
             roll_bar.update(f"{self.last_roll_text}  │  [bold #f00]GAME OVER[/]")
+        else:
+            # Generate new suggestions for the next action
+            suggestions = generate_suggestions(self.character, self.context)
+            self.update_suggestions(suggestions)
 
         input_widget.disabled = False
         input_widget.focus()
@@ -929,6 +999,14 @@ class RPGApp(App):
                 input_widget = self.query_one("#action-input", Input)
                 input_widget.value = "!"
                 input_widget.action_submit()
+
+        # Suggestion buttons
+        elif button_id == "suggestion-1":
+            self.handle_action(self.suggestions[0])
+        elif button_id == "suggestion-2":
+            self.handle_action(self.suggestions[1])
+        elif button_id == "suggestion-3":
+            self.handle_action(self.suggestions[2])
 
         # TTS speed controls
         elif button_id == "tts-slower":

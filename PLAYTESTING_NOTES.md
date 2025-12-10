@@ -702,3 +702,264 @@ What tone would you like?
 **Priority**: HIGH
 **Impact**: Ruins otherwise functional game
 **Fix**: Remove tone randomization from SETUP_PROMPT
+
+---
+
+## IMPLEMENTED FIX: Removed Random Tone System
+**Date**: 2024-12-10
+
+### Changes Made
+1. **engine.py**: Removed `STORY_TONES` list and `random.choice()` call
+2. **prompts.py**: Updated `SETUP_PROMPT` to infer tone from character concept
+3. **New approach**: LLM matches tone to character naturally
+   - "Pragmatic engineer" → technical/realistic
+   - "Lonely ghost" → gothic/atmospheric
+   - "Caveman hunter" → primal/survival
+
+### Rationale
+- Random tone selection caused jarring mismatches (engineer + comedy = broccoli revolt)
+- Character concept already implies appropriate tone
+- Trust 4o-mini to match tone based on context
+- Ghost session (Session 4) worked perfectly without explicit tone guidance
+- Removes forced, scripted feeling
+- Increases immersion and player agency
+
+### Testing Needed
+- Retry moon engineer scenario to see if tone improves
+- Test if LLM consistently picks appropriate tones
+- Verify variety still exists (not all stories same tone)
+
+---
+
+## IMPLEMENTED FIX: Lethal Flags & Non-Combat Emphasis
+**Date**: 2024-12-10
+
+### Changes Made to INTERPRETER_PROMPT
+1. **Difficulty recalibration**: Added "DEFAULT for most actions" to difficulty 3, emphasized 4-5 should be rare
+2. **Strict lethal guidelines**:
+   - ONLY mark lethal when failure = direct death
+   - Explicitly exclude: fleeing (caught, not dead), hiding (detected, not dead), searching in danger (found, not dead)
+   - "When in doubt, mark as NON-lethal"
+
+### Changes Made to NARRATOR_PROMPT
+Added "VARY YOUR NARRATIVE APPROACH" section:
+- Not every conflict needs combat
+- Failures create complications, not just new enemies
+- Respect character concepts (low Body = offer non-combat solutions)
+- High Mind/Spirit should face mental/social challenges
+- Encourage negotiation, discovery, relationships, problem-solving
+
+### Rationale
+**From user feedback**: "i was running into the issue of like failing a roll 3 times while pinned down and extremely injured. like what am i supposed to do there."
+- Problem isn't difficulty being too hard
+- Problem is getting into unwinnable "pinned down" situations
+- Caused by marking fleeing/searching as lethal when should just get caught
+- **Combat should be hard** - but you shouldn't be trapped with no escape
+
+**Design direction**: "lean in on non combat situations so its fine if combat is hard"
+- Ghost session (non-combat) was most successful and engaging
+- System's strength is social/emotional/investigation gameplay
+- Combat can be deadly if non-combat alternatives exist
+
+### Testing Plan
+Need to verify non-combat success wasn't a fluke:
+1. **One combat test** (warrior/fighter) - verify combat is still challenging but fair
+2. **Multiple non-combat tests**:
+   - Social/political intrigue (diplomat, noble, politician)
+   - Investigation/mystery (journalist, researcher, private eye)
+   - Exploration/survival (explorer, scientist, wanderer)
+   - Relationship-focused (therapist, matchmaker, social worker)
+   - Creative problem-solving (inventor, artist, con artist)
+
+### Success Metrics
+- Lethal flags only on actual death actions (not fleeing/hiding)
+- Non-combat sessions reach 15+ turns consistently
+- Variety of narrative types (not all defaulting to combat)
+- Clear escape routes from dangerous situations
+- Failures create interesting complications, not death spirals
+
+---
+
+## COMPREHENSIVE FINDINGS SUMMARY
+
+### What Works ✅
+1. **Universal System** - Any character concept works (rat, caveman, detective, ghost, engineer)
+2. **Relationship Persistence** - 4o-mini tracks NPCs across 26+ turns (names, backstory, emotions, mechanical impact)
+3. **Non-Combat Gameplay** - 26-turn social/emotional story proved it's viable and engaging
+4. **Stat Specialization** - High stat in one area (Spirit 5) performs better than balanced stats
+5. **Character Design Influences Narrative** - High Body → combat, High Mind/Spirit → investigation/social
+6. **Technology Consistency** - System handles fantasy, prehistoric, Victorian, supernatural, and sci-fi settings
+7. **Investigation/Mystery Works** - Detective and engineer sessions showed problem-solving gameplay
+8. **Variety Possible** - Successfully tested romance, horror, mystery, comedy (when appropriate)
+
+### Major Issues ⚠️
+
+#### 1. Difficulty Too High (CRITICAL)
+- **Average across all sessions: 3.17** (should be ~2.5)
+- **44% of actions are difficulty 4** (should be ~20%)
+- **Pattern**: Interpreter defaults to difficulty 4 whenever stakes are present
+- **Impact**: Even specialists (stat 5) have only ~50% success on their specialty
+- **Examples**:
+  - Navigating home territory = Difficulty 4
+  - Expert hunter dodging = Difficulty 4
+  - Caveman with Body 5 attacking = Difficulty 4
+
+**Proposed Fix**: Add explicit difficulty calibration to INTERPRETER_PROMPT
+```
+Default to difficulty 2-3 for most actions. Reserve 4-5 for truly exceptional circumstances.
+Difficulty 4 = Hard (often fails without expertise)
+Difficulty 5 = Extreme (heroic feat, rarely succeeds)
+```
+
+#### 2. Deaths Feel Unlucky, Not Earned (HIGH PRIORITY)
+- **75% of deaths occurred on character's BEST stat**
+- All death sessions ended 8-14 turns (average 10.7)
+- Deaths from single bad rolls (40-50% success rate)
+- No recovery mechanic from near-death experiences
+
+**Examples**:
+- Detective (Mind 4) rolled 1 navigating with partner (critical fail)
+- Caveman (Body 5) rolled 4 dodging (coin flip failed)
+- Rat (Body 2) rolled 4 fleeing through crawlspace (40% success, died)
+
+**Proposed Fix Options**:
+- **Injury System** (two-stage death): First lethal fail = wounded (-1 all stats), second = death
+- **Luck Points** (Spirit stat worth of rerolls)
+- **Advantage/Disadvantage** (roll 2d10, take higher/lower based on circumstances)
+- **Critical Fail Protection** (natural 1 = failure but not death, or reroll once per session)
+
+#### 3. Lethal Flag Misuse (IMPROVING)
+- Session 1: Misused (fleeing/searching marked lethal)
+- Sessions 2-4: Improved (mostly appropriate)
+- **Root issue**: Interpreter marks actions lethal when danger is NEARBY, not when the action itself causes death
+
+**Proposed Fix**: Add explicit guidelines to INTERPRETER_PROMPT
+```
+ONLY mark lethal when FAILURE would directly cause death:
+- Attacking deadly enemy in combat
+- Falling from lethal height
+- Immediate deadly environment
+
+DO NOT mark lethal:
+- Fleeing/hiding (failure = caught, not dead)
+- Searching (failure = detected, not dead)
+```
+
+#### 4. Random Tone System (FIXED ✅)
+- **Was**: Randomly assigned tone caused mismatches (engineer + comedy = broccoli revolt)
+- **Now**: LLM infers tone from character concept
+- **Testing needed**: Verify this works consistently
+
+#### 5. Combat Treadmill (CONDITIONAL - Character Dependent)
+- High Body characters → endless combat spawns
+- High Mind/Spirit characters → investigation/social focus
+- **Root cause**: Character design signals narrator to create certain scenarios
+- **Not necessarily a bug**: System adapts to character archetype
+- **Consider**: Is this desirable? Or should low-Body characters still face combat?
+
+### Medium Issues 🔶
+
+#### 6. No Difficulty 1 Actions (54 actions, zero difficulty 1)
+- Suggests calibration is off
+- Even trivial actions get difficulty 2+
+- May contribute to overall difficulty being too high
+
+#### 7. Session Length Disparity
+- Death sessions: 8-14 turns (feels short, stories cut off)
+- Survival session: 26 turns (felt complete)
+- **Question**: Should we aim for longer sessions? Or is 8-14 acceptable?
+
+#### 8. Success Rate Inconsistency
+- Combat characters: 50-75% success (tense but frustrating)
+- Social characters: 69% success (challenging but fair)
+- Specialists survive, generalists die
+
+### Minor Issues 📝
+
+#### 9. Invalid Action Detection
+- "Pause to catch breath and thank Shadow" rejected (Turn 13, ghost session)
+- System wants active choices, not reflective moments
+- **Question**: Feature or bug? Should we allow reflective roleplay?
+
+#### 10. Critical Fail Clustering
+- Ghost session: Three natural 1s in four turns (19, 20, 21)
+- 10% chance each, getting multiple is brutal
+- Consider critical fail mitigation?
+
+---
+
+## Key Insights for Design Direction
+
+### 1. Stat Specialization > Balanced Stats
+- Ghost (Spirit 5): Survived 26 turns
+- Caveman (Body 5): Died turn 8 using Body constantly
+- Detective (Mind 4): Died turn 14 using Mind
+- **Pattern**: High stats aren't enough if difficulty is too high
+
+### 2. Non-Combat is the Breakthrough
+- Longest session (26 turns) had zero combat
+- Most engaging narrative (Elara relationship arc)
+- Lower difficulty average (2.8 vs 3.3+)
+- **Implication**: System excels at social/emotional/investigation gameplay
+
+### 3. Character Design Guides Narrative Type
+- This might be a feature, not a bug
+- Gives players agency to choose gameplay style via stats
+- Body 5 = combat-heavy, Spirit 5 = social-heavy
+- **Question**: Should we lean into this or fight it?
+
+### 4. Relationship Mechanics are Gold
+- Most memorable moments involved NPCs (Elara, Shadow, Dr. Ramirez)
+- Emotional stakes as compelling as survival stakes
+- 4o-mini handles complexity surprisingly well
+- **Opportunity**: Could add light inventory/relationship tracking to prompts
+
+### 5. Difficulty Calibration is the Priority Fix
+- Single biggest issue affecting all sessions
+- Makes specialists feel weak (stat 5 = coin flip)
+- Easy to fix (just update INTERPRETER_PROMPT)
+- Would immediately improve game feel
+
+---
+
+## Proposed Changes (Priority Order)
+
+### Priority 1: MUST FIX
+1. ✅ **Remove random tone** (DONE)
+2. **Recalibrate difficulty** (update INTERPRETER_PROMPT with explicit guidelines)
+3. **Fix lethal flag guidelines** (update INTERPRETER_PROMPT)
+
+### Priority 2: STRONGLY CONSIDER
+4. **Injury system** (two-stage death to reduce frustration)
+5. **Luck points** (Spirit stat worth of rerolls)
+6. **Test tone fix** (retry moon engineer, verify consistency)
+
+### Priority 3: EVALUATE LATER
+7. Advantage/disadvantage system
+8. Success tiers (critical success = bonus effect)
+9. Context bonuses (chain successes)
+10. Critical fail mitigation
+11. Invalid action policy (allow reflective moments?)
+12. Light inventory tracking
+
+---
+
+## Next Steps
+
+**Option A - Implement Core Fixes Now**:
+1. Update INTERPRETER_PROMPT (difficulty + lethal guidelines)
+2. Add injury system
+3. Add luck points
+4. Test with 2-3 sessions to verify improvements
+
+**Option B - More Testing First**:
+1. Test tone fix (retry moon engineer)
+2. Run 2-3 more varied scenarios (modern, sci-fi, fantasy)
+3. Gather more data on difficulty patterns
+4. Then implement fixes
+
+**Option C - Targeted Testing**:
+1. Test one scenario with manually adjusted difficulty (use god mode to simulate)
+2. See if lowering difficulty to 2-3 average improves experience
+3. If yes, implement INTERPRETER_PROMPT fix
+4. If no, consider different solutions

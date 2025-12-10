@@ -1,41 +1,37 @@
 """
-Text-to-Speech module using pyttsx3 for reading game narrative.
+Text-to-Speech module using Windows SAPI for reading game narrative.
 """
-import pyttsx3
-import threading
+import win32com.client
 from typing import Optional
 import re
 
 
 class TTS:
-    """Lightweight TTS wrapper using pyttsx3."""
+    """Lightweight TTS wrapper using Windows SAPI."""
 
     def __init__(self):
-        self.engine: Optional[pyttsx3.Engine] = None
+        self.speaker = None
         self.enabled = False
-        self.rate = 175  # Track current rate
-        self.voices = []  # Available voices
-        self.current_voice_index = 0  # Track current voice
-        self._lock = threading.Lock()
-        self._speech_id = 0  # Unique ID for each speech session
-        self._current_speech_id = 0  # ID of currently allowed speech
+        self.rate = 0  # SAPI uses -10 to 10 scale
+        self.voices = None
+        self.current_voice_index = 0
         self._init_engine()
 
     def _init_engine(self):
-        """Initialize the TTS engine."""
+        """Initialize the SAPI speech engine."""
         try:
-            self.engine = pyttsx3.init()
-            # Set properties for better performance
-            self.engine.setProperty('rate', self.rate)  # Speed (default is ~200)
-            self.engine.setProperty('volume', 0.9)  # Volume (0.0 to 1.0)
+            self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
+            # Set initial properties
+            self.speaker.Rate = self.rate
+            self.speaker.Volume = 90  # 0-100 scale
 
             # Get available voices
-            self.voices = self.engine.getProperty('voices')
-            if self.voices:
-                self.engine.setProperty('voice', self.voices[0].id)
+            self.voices = self.speaker.GetVoices()
+            if self.voices.Count > 0:
+                self.speaker.Voice = self.voices.Item(0)
         except Exception as e:
             print(f"Warning: Could not initialize TTS: {e}")
-            self.engine = None
+            self.speaker = None
 
     def toggle(self) -> bool:
         """Toggle TTS on/off. Returns new state."""
@@ -66,7 +62,7 @@ class TTS:
             blocking: If True, wait for speech to complete. If False, return immediately.
             interrupt: If True, stop any current speech before starting new speech.
         """
-        if not self.enabled or not self.engine:
+        if not self.enabled or not self.speaker:
             return
 
         # Clean the text
@@ -75,93 +71,85 @@ class TTS:
         if not clean_text:
             return
 
-        # Assign a unique ID to this speech session
-        self._speech_id += 1
-        my_speech_id = self._speech_id
-
-        # If interrupting, update the current allowed speech ID
         if interrupt:
-            self._current_speech_id = my_speech_id
+            # Purge any existing speech immediately
+            # Flags: 1=Async, 2=PurgeBeforeSpeak
+            self.speaker.Speak("", 1 | 2)
 
+        # Speak with flags
         if blocking:
-            # Block until speech completes
-            if my_speech_id != self._current_speech_id:
-                return
-            try:
-                # Create a fresh engine for this speech to avoid state issues
-                temp_engine = pyttsx3.init()
-                temp_engine.setProperty('rate', self.rate)
-                if self.voices and self.current_voice_index < len(self.voices):
-                    temp_engine.setProperty('voice', self.voices[self.current_voice_index].id)
-                temp_engine.say(clean_text)
-                temp_engine.runAndWait()
-                del temp_engine
-            except Exception as e:
-                pass
+            self.speaker.Speak(clean_text, 0)  # Synchronous (0)
         else:
-            # Speak in background thread
-            def _speak():
-                # Only speak if this is the current allowed speech
-                if my_speech_id != self._current_speech_id:
-                    return
-                try:
-                    # Create a fresh engine for this speech to avoid state issues
-                    temp_engine = pyttsx3.init()
-                    temp_engine.setProperty('rate', self.rate)
-                    if self.voices and self.current_voice_index < len(self.voices):
-                        temp_engine.setProperty('voice', self.voices[self.current_voice_index].id)
-                    temp_engine.say(clean_text)
-                    temp_engine.runAndWait()
-                    del temp_engine
-                except Exception as e:
-                    pass
-
-            thread = threading.Thread(target=_speak, daemon=True)
-            thread.start()
+            self.speaker.Speak(clean_text, 1)  # Asynchronous (1)
 
     def stop(self):
-        """Stop current speech."""
-        # Invalidate all current speech by incrementing the ID
-        # Any running threads will see their ID doesn't match and exit
-        self._speech_id += 1
-        self._current_speech_id = self._speech_id
+        """Stop current speech immediately."""
+        if self.speaker:
+            # Immediate stop with queue purge
+            # Flags: 1=Async, 2=PurgeBeforeSpeak
+            self.speaker.Speak("", 1 | 2)
 
     def adjust_speed(self, delta: int) -> int:
         """
-        Adjust TTS speed by delta. Returns new rate.
+        Adjust TTS speed by delta. Returns new rate for display.
 
         Args:
             delta: Amount to change speed (positive = faster, negative = slower)
 
         Returns:
-            New speed rate
+            New speed rate in display scale (100-300)
         """
-        # Clamp rate between 100 (slow) and 300 (very fast)
-        self.rate = max(100, min(300, self.rate + delta))
-        return self.rate
+        if not self.speaker:
+            return self._sapi_to_display(self.rate)
+
+        # Convert delta from our 25-unit steps to SAPI's 1-unit steps
+        # Our scale: 100-300 (delta ±25) -> SAPI scale: -10 to 10 (delta ±1)
+        sapi_delta = delta // 25
+
+        # Clamp rate between -10 (slow) and 10 (fast)
+        self.rate = max(-10, min(10, self.rate + sapi_delta))
+        self.speaker.Rate = self.rate
+
+        return self._sapi_to_display(self.rate)
 
     def get_speed(self) -> int:
-        """Get current TTS speed rate."""
-        return self.rate
+        """Get current TTS speed rate in display scale (100-300)."""
+        return self._sapi_to_display(self.rate)
+
+    def _sapi_to_display(self, sapi_rate: int) -> int:
+        """Convert SAPI rate (-10 to 10) to display rate (100-300)."""
+        # Map -10 to 100, 0 to 200, 10 to 300
+        return 200 + (sapi_rate * 10)
 
     def get_voices(self) -> list:
         """Get list of available voices."""
-        return self.voices
+        if not self.voices:
+            return []
+        return [self.voices.Item(i) for i in range(self.voices.Count)]
 
     def get_current_voice_name(self) -> str:
         """Get the name of the current voice."""
-        if not self.voices:
+        if not self.voices or self.voices.Count == 0:
             return "None"
-        return self.voices[self.current_voice_index].name.split(' - ')[0]
+        try:
+            voice = self.voices.Item(self.current_voice_index)
+            # Get description and strip extra info
+            desc = voice.GetDescription()
+            # Usually format is "Name - Extra info", we just want the name
+            return desc.split(' - ')[0] if ' - ' in desc else desc
+        except:
+            return "Unknown"
 
     def cycle_voice(self) -> str:
         """
         Cycle to the next available voice. Returns the new voice name.
         """
-        if not self.voices:
+        if not self.speaker or not self.voices or self.voices.Count == 0:
             return "None"
 
-        self.current_voice_index = (self.current_voice_index + 1) % len(self.voices)
+        self.current_voice_index = (self.current_voice_index + 1) % self.voices.Count
+        self.speaker.Voice = self.voices.Item(self.current_voice_index)
+
         return self.get_current_voice_name()
 
 
