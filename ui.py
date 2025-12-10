@@ -148,12 +148,20 @@ def generate_suggestions(character: str, narrative: str) -> list[str]:
         response = call_llm(prompt, json_mode=True)
         logger.debug(f"Suggestions response: {response}")
 
-        suggestions = json.loads(response)
-        if isinstance(suggestions, list) and len(suggestions) == 3:
-            logger.info(f"Generated suggestions: {suggestions}")
-            return suggestions
+        data = json.loads(response)
 
-        logger.warning(f"Invalid suggestions format: {suggestions}")
+        # Handle both direct array and wrapped object formats
+        if isinstance(data, list) and len(data) == 3:
+            logger.info(f"Generated suggestions: {data}")
+            return data
+        elif isinstance(data, dict):
+            # Try common wrapper keys
+            for key in ['actions', 'suggestions', 'options']:
+                if key in data and isinstance(data[key], list) and len(data[key]) == 3:
+                    logger.info(f"Generated suggestions: {data[key]}")
+                    return data[key]
+
+        logger.warning(f"Invalid suggestions format: {data}")
         return ["Continue forward", "Look around carefully", "Wait and observe"]
     except Exception as e:
         logger.error(f"Failed to generate suggestions: {e}")
@@ -244,8 +252,6 @@ class RPGApp(App):
         color: #888;
         text-align: left;
         padding: 0 1;
-        overflow-x: auto;
-        text-overflow: ellipsis;
     }
 
     .suggestion-btn:hover {
@@ -575,6 +581,8 @@ class RPGApp(App):
         self.game_started = False
         self._prompt_animation_task = None
         self.suggestions = ["...", "...", "..."]  # Current action suggestions
+        self._scroll_positions = [0, 0, 0]  # Track scroll position for each button
+        self._scroll_timer = None
 
         # Initialize TTS (enabled by default)
         get_tts().set_enabled(True)
@@ -756,10 +764,39 @@ class RPGApp(App):
     def update_suggestions(self, suggestions: list[str]) -> None:
         """Update the suggestion buttons with new text."""
         self.suggestions = suggestions
-        for i, suggestion in enumerate(suggestions, 1):
+        self._scroll_positions = [0, 0, 0]  # Reset scroll positions
+
+        # Stop existing timer
+        if self._scroll_timer:
+            self._scroll_timer.stop()
+
+        # Start scrolling timer (faster scroll)
+        self._scroll_timer = self.set_interval(0.15, self._scroll_suggestions)
+
+    def _scroll_suggestions(self) -> None:
+        """Scroll text in suggestion buttons like a news ticker."""
+        for i, suggestion in enumerate(self.suggestions):
             try:
-                btn = self.query_one(f"#suggestion-{i}", Button)
-                btn.label = suggestion
+                btn = self.query_one(f"#suggestion-{i + 1}", Button)
+
+                # Calculate max width based on button's actual size (subtract padding)
+                # Button width in cells minus padding (2 chars for padding)
+                max_width = max(20, btn.size.width - 4)
+
+                if len(suggestion) <= max_width:
+                    # Short enough, no scrolling needed
+                    display_text = suggestion
+                else:
+                    # Scroll the text
+                    pos = self._scroll_positions[i]
+                    # Add spacing between end and start
+                    padded = suggestion + "   ...   "
+                    # Circular scroll
+                    display_text = (padded * 2)[pos:pos + max_width]
+                    # Advance position
+                    self._scroll_positions[i] = (pos + 1) % len(padded)
+
+                btn.label = display_text
             except:
                 pass
 
@@ -907,6 +944,19 @@ class RPGApp(App):
         else:
             success, final_roll = roll_check(stat_value, difficulty)
 
+        # === CALCULATE SUCCESS CHANCE ===
+        # Success if: roll + stat - difficulty > 5
+        # So need: roll > 5 - stat + difficulty
+        threshold = 5 - stat_value + difficulty
+        # Chance = number of winning rolls / 10
+        if threshold < 1:
+            chance_pct = 100  # Always succeed
+        elif threshold > 10:
+            chance_pct = 0  # Always fail
+        else:
+            winning_rolls = 10 - threshold + 1
+            chance_pct = winning_rolls * 10
+
         # === DICE ANIMATION ===
         animation_frames = 8
         frame_delay = 0.12
@@ -914,8 +964,8 @@ class RPGApp(App):
         for i in range(animation_frames):
             fake_roll = random.randint(1, 10)
             roll_bar.update(
-                f"🎲 [{stat_color}]{stat.upper()}[/] ({stat_value}) vs Difficulty {difficulty}{lethal_text} │ "
-                f"Rolling... [{fake_roll}]"
+                f"[{stat_color}]{stat.upper()}[/] {stat_value} vs DC {difficulty}{lethal_text} │ "
+                f"{chance_pct}% chance │ Rolling..."
             )
             await asyncio.sleep(frame_delay)
 
@@ -926,18 +976,18 @@ class RPGApp(App):
         logger.info(f"Roll: {stat} d10={final_roll} +{stat_value} -{difficulty} = {total} -> {'SUCCESS' if success else 'FAILURE'}{' DEATH' if died else ''}")
 
         if died:
-            result_text = "[#f00]DEATH[/]"
+            result_text = "[bold #f00]💀 DEATH[/]"
         elif success:
-            result_text = "[#0f9]SUCCESS[/]"
+            result_text = "[bold #0f9]✓ SUCCESS[/]"
         else:
-            result_text = "[#fa0]FAILURE[/]"
+            result_text = "[bold #fa0]✗ FAILURE[/]"
 
         miracle_text = " [#f0a]✦ MIRACULOUS[/]" if (force_mode or god_mode) and success else ""
 
-        # Final roll display: 🎲 BODY (3) vs Difficulty 2 │ Rolled [8] + 3 - 2 = 9 → SUCCESS
+        # Final roll display
         self.last_roll_text = (
-            f"🎲 [{stat_color}]{stat.upper()}[/] ({stat_value}) vs Difficulty {difficulty}{lethal_text} │ "
-            f"Rolled [{final_roll}] + {stat_value} - {difficulty} = {total} → {result_text}{miracle_text}"
+            f"[{stat_color}]{stat.upper()}[/] {stat_value} vs DC {difficulty}{lethal_text} │ "
+            f"{chance_pct}% chance │ {result_text}{miracle_text}"
         )
         roll_bar.update(self.last_roll_text)
 
