@@ -8,6 +8,7 @@ import json
 import os
 from openai import OpenAI
 from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
+from config import get_config
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
@@ -19,25 +20,45 @@ def roll_check(stat_value: int, difficulty: int) -> tuple[bool, int]:
     return result > 5, roll
 
 
-def call_llm(prompt: str, system: str = None, json_mode: bool = False) -> str:
-    """Call OpenAI API"""
+def call_llm(prompt: str, system: str = None, json_mode: bool = False, task: str = "narrator") -> str:
+    """Call OpenAI API with token tracking.
+
+    Args:
+        prompt: The user prompt to send
+        system: Optional system prompt
+        json_mode: Whether to request JSON response
+        task: "narrator", "interpreter", or "suggestions" - determines which model to use
+    """
+    config = get_config()
+    if task == "interpreter":
+        model = config.interpreter_model
+    elif task == "suggestions":
+        model = config.suggestions_model
+    else:
+        model = config.narrator_model
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    kwargs = {"model": "gpt-4o-mini", "messages": messages}
+    kwargs = {"model": model, "messages": messages}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
     response = client.chat.completions.create(**kwargs)
+
+    # Track token usage
+    if response.usage:
+        config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
+
     return response.choices[0].message.content
 
 
 def interpret_action(action: str, context: str) -> dict:
     """Use LLM to determine stat and difficulty for an action"""
     prompt = f"Context: {context}\n\nPlayer action: {action}"
-    response = call_llm(prompt, system=INTERPRETER_PROMPT, json_mode=True)
+    response = call_llm(prompt, system=INTERPRETER_PROMPT, json_mode=True, task="interpreter")
 
     try:
         result = json.loads(response)
@@ -97,20 +118,46 @@ def opening_scene(character: str, stats: dict) -> str:
 
 
 def generate_suggestions(character: str, narrative: str) -> list[str]:
-    """Generate 3 action suggestions for the current situation."""
+    """Generate 3 action suggestions for the current situation.
+
+    Handles multiple response formats from different LLM models:
+    - Array: ["action1", "action2", "action3"]
+    - Dict with string keys: {"0": "action1", "1": "action2", "2": "action3"}
+    - Dict with suggestions key: {"suggestions": ["action1", ...]}
+    - Any dict with 3+ values
+    """
     prompt = SUGGESTIONS_PROMPT.format(
         character=character,
         narrative=narrative
     )
-    response = call_llm(prompt, json_mode=True)
+    response = call_llm(prompt, json_mode=True, task="suggestions")
+    fallback = ["Continue forward", "Look around carefully", "Wait and observe"]
 
     try:
-        suggestions = json.loads(response)
-        if isinstance(suggestions, list) and len(suggestions) == 3:
-            return suggestions
-        return ["Continue forward", "Look around carefully", "Wait and observe"]
+        data = json.loads(response)
+
+        # Handle array format (expected)
+        if isinstance(data, list) and len(data) >= 3:
+            return [str(s) for s in data[:3]]
+
+        # Handle dict formats
+        if isinstance(data, dict):
+            # Dict with numeric string keys ("0", "1", "2")
+            if all(str(i) in data for i in range(3)):
+                return [str(data[str(i)]) for i in range(3)]
+            # Dict with "suggestions" key
+            if "suggestions" in data and isinstance(data["suggestions"], list):
+                sug = data["suggestions"]
+                if len(sug) >= 3:
+                    return [str(s) for s in sug[:3]]
+            # Any dict with 3+ values - take first 3
+            values = list(data.values())
+            if len(values) >= 3:
+                return [str(v) for v in values[:3]]
+
+        return fallback
     except:
-        return ["Continue forward", "Look around carefully", "Wait and observe"]
+        return fallback
 
 
 class RPGGame:

@@ -94,10 +94,17 @@ Write a short narrative (2-4 sentences) describing what happens.
 CRITICAL - ADVANCE THE STORY:
 - Every response must move the narrative FORWARD. Introduce new elements, complications, or discoveries.
 - NEVER describe the same situation twice. If they're fighting, resolve it and move on.
-- After combat: the enemy is defeated/escaped/something interrupts. Don't describe endless back-and-forth.
 - After success: reveal something new (a clue, a character, a twist, a new location).
 - After failure: the situation changes (enemy gains advantage, opportunity lost, new problem arises).
 - The world should feel alive and reactive, not static.
+
+COMBAT MUST BE DECISIVE (VERY IMPORTANT):
+- Combat is resolved in ONE roll. No drawn-out exchanges.
+- SUCCESS in a fight = the enemy is DEFEATED (killed, knocked out, surrenders, flees). The fight is OVER.
+- FAILURE in a fight = you LOSE decisively (captured, badly wounded, forced to flee, or dead if lethal).
+- Never leave combat in a "you trade blows" or "the fight continues" state.
+- After any combat roll, the conflict is RESOLVED. Move to what happens next.
+- The excitement is in the CONSEQUENCES of combat, not the combat itself.
 
 VARY YOUR NARRATIVE APPROACH:
 - Not every conflict needs to be resolved through combat
@@ -155,5 +162,5 @@ Generate exactly 3 suggestions that are:
 3. Specific to the current situation
 4. Appropriate to the character concept
 
-Respond with ONLY a JSON array of 3 strings. No other text.
-Example format: ["Approach cautiously with weapon ready", "Call out and offer to talk", "Search for another way around"]"""
+Respond with valid JSON containing a "suggestions" key with an array of exactly 3 strings.
+Example: {{"suggestions": ["Approach cautiously with weapon ready", "Call out and offer to talk", "Search for another way around"]}}"""

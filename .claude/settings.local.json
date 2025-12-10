@@ -12,7 +12,12 @@
       "Bash(.\\venv\\Scripts\\pip.exe install:*)",
       "Bash(./venv/Scripts/python.exe:*)",
       "Bash(find:*)",
-      "Bash(git config:*)"
+      "Bash(git config:*)",
+      "Bash(c:\\Users\\david\\projects\\RPGengine\\venv\\Scripts\\pip.exe install:*)",
+      "Bash(git -C c:UsersdavidprojectsRPGengine rm --cached rpg_engine.log)",
+      "Bash(git rm:*)",
+      "Bash(type c:UsersdavidprojectsRPGengine*.log)",
+      "Bash(dir:*)"
     ],
     "deny": [],
     "ask": []

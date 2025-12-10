@@ -1,6 +1,7 @@
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, ScrollableContainer, Container, Center
-from textual.widgets import Header, Footer, Static, Input, Button, Rule, ProgressBar
+from textual.widgets import Static, Input, Button, Select, Switch, TextArea
+from textual.screen import ModalScreen
 from textual.binding import Binding
 from textual.reactive import reactive
 from rich.text import Text
@@ -12,6 +13,7 @@ import asyncio
 from openai import OpenAI
 from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
 from tts import get_tts
+from config import get_config, LLM_MODELS, TTS_MODELS, TTS_VOICES
 
 STAT_COLORS = {"mind": "#0af", "body": "#fa0", "spirit": "#f0a"}
 
@@ -51,19 +53,40 @@ def roll_check(stat_value: int, difficulty: int) -> tuple[bool, int]:
     return result > 5, roll
 
 
-def call_llm(prompt: str, system: str = None, json_mode: bool = False) -> str:
+def call_llm(prompt: str, system: str = None, json_mode: bool = False, task: str = "narrator") -> str:
+    """Call OpenAI LLM API.
+
+    Args:
+        prompt: The user prompt
+        system: Optional system prompt
+        json_mode: Whether to request JSON response
+        task: "narrator", "interpreter", or "suggestions" to select model from config
+    """
+    config = get_config()
+    if task == "interpreter":
+        model = config.interpreter_model
+    elif task == "suggestions":
+        model = config.suggestions_model
+    else:
+        model = config.narrator_model
+
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
 
-    kwargs = {"model": "gpt-4o-mini", "messages": messages}
+    kwargs = {"model": model, "messages": messages}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    logger.debug(f"LLM request: {prompt[:200]}...")
+    logger.debug(f"LLM request ({model}): {prompt[:200]}...")
     try:
         response = client.chat.completions.create(**kwargs)
+
+        # Track token usage
+        if response.usage:
+            config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
+
         result = response.choices[0].message.content
         logger.debug(f"LLM response: {result[:200]}...")
         return result
@@ -74,7 +97,7 @@ def call_llm(prompt: str, system: str = None, json_mode: bool = False) -> str:
 
 def interpret_action(action: str, context: str) -> dict:
     prompt = f"Context: {context}\n\nPlayer action: {action}"
-    response = call_llm(prompt, system=INTERPRETER_PROMPT, json_mode=True)
+    response = call_llm(prompt, system=INTERPRETER_PROMPT, json_mode=True, task="interpreter")
 
     try:
         result = json.loads(response)
@@ -145,7 +168,7 @@ def generate_suggestions(character: str, narrative: str) -> list[str]:
     )
 
     try:
-        response = call_llm(prompt, json_mode=True)
+        response = call_llm(prompt, json_mode=True, task="suggestions")
         logger.debug(f"Suggestions response: {response}")
 
         data = json.loads(response)
@@ -172,13 +195,278 @@ IDENTITY_PROMPTS = [
     "Who are you?",
     "What are you?",
     "Where do you come from?",
-    "Who will you become?",
     "What is your name?",
-    "What do you seek?",
-    "Who do you serve?",
-    "What haunts you?",
-    "Why are you here?",
 ]
+
+
+class SettingsScreen(ModalScreen):
+    """Modal screen for settings."""
+
+    CSS = """
+    SettingsScreen {
+        align: center middle;
+    }
+
+    #settings-container {
+        width: 64;
+        height: auto;
+        background: #1a1a2e;
+        border: solid #0af;
+        padding: 1 2;
+    }
+
+    #settings-title {
+        text-align: center;
+        text-style: bold;
+        color: #0af;
+        margin-bottom: 1;
+    }
+
+    .settings-section {
+        margin-bottom: 1;
+    }
+
+    .settings-section-title {
+        color: #fa0;
+        text-style: bold;
+    }
+
+    .settings-row {
+        height: 3;
+    }
+
+    .settings-label {
+        width: 16;
+        padding-top: 1;
+    }
+
+    .settings-select {
+        width: 40;
+    }
+
+    #settings-close {
+        margin-top: 1;
+        width: 100%;
+    }
+
+    #tts-speed-row {
+        height: 3;
+    }
+
+    #tts-speed-label {
+        width: 16;
+        padding-top: 1;
+    }
+
+    #tts-speed-controls {
+        width: 40;
+    }
+
+    .speed-btn {
+        width: 5;
+        min-width: 5;
+    }
+
+    #tts-speed-display {
+        width: 8;
+        text-align: center;
+        padding-top: 1;
+    }
+
+    #cost-estimate {
+        color: #888;
+        padding-left: 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close_settings", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        config = get_config()
+        tts = get_tts()
+
+        # Build model options
+        llm_options = [(m, m) for m in LLM_MODELS]
+        tts_model_options = [(m, m) for m in TTS_MODELS]
+        voice_options = [(v.capitalize(), v) for v in TTS_VOICES]
+
+        with Container(id="settings-container"):
+            yield Static("⚙ SETTINGS", id="settings-title")
+
+            # LLM Models section
+            with Vertical(classes="settings-section"):
+                yield Static("LLM Models", classes="settings-section-title")
+                with Horizontal(classes="settings-row"):
+                    yield Static("Narrator:", classes="settings-label")
+                    yield Select(
+                        llm_options,
+                        value=config.narrator_model,
+                        id="narrator-model-select",
+                        classes="settings-select"
+                    )
+                with Horizontal(classes="settings-row"):
+                    yield Static("Interpreter:", classes="settings-label")
+                    yield Select(
+                        llm_options,
+                        value=config.interpreter_model,
+                        id="interpreter-model-select",
+                        classes="settings-select"
+                    )
+                with Horizontal(classes="settings-row"):
+                    yield Static("Suggestions:", classes="settings-label")
+                    yield Select(
+                        llm_options,
+                        value=config.suggestions_model,
+                        id="suggestions-model-select",
+                        classes="settings-select"
+                    )
+
+            # TTS section
+            with Vertical(classes="settings-section"):
+                yield Static("Text-to-Speech", classes="settings-section-title")
+                with Horizontal(classes="settings-row"):
+                    yield Static("Enabled:", classes="settings-label")
+                    yield Switch(value=config.tts_enabled, id="tts-enabled-switch")
+                with Horizontal(classes="settings-row"):
+                    yield Static("Model:", classes="settings-label")
+                    yield Select(
+                        tts_model_options,
+                        value=config.tts_model,
+                        id="tts-model-select",
+                        classes="settings-select"
+                    )
+                with Horizontal(classes="settings-row"):
+                    yield Static("Voice:", classes="settings-label")
+                    yield Select(
+                        voice_options,
+                        value=config.tts_voice,
+                        id="tts-voice-select",
+                        classes="settings-select"
+                    )
+                with Horizontal(id="tts-speed-row"):
+                    yield Static("Speed:", id="tts-speed-label")
+                    with Horizontal(id="tts-speed-controls"):
+                        yield Button("◀", id="settings-tts-slower", classes="speed-btn")
+                        yield Static(str(tts.get_speed()), id="tts-speed-display")
+                        yield Button("▶", id="settings-tts-faster", classes="speed-btn")
+
+            # Cost estimate section
+            with Vertical(classes="settings-section"):
+                yield Static("Cost Estimate", classes="settings-section-title")
+                yield Static(self._get_cost_estimate(), id="cost-estimate")
+
+            yield Button("Close", id="settings-close", variant="primary")
+
+    def _get_cost_estimate(self) -> str:
+        """Calculate estimated cost per message based on current settings."""
+        config = get_config()
+
+        # LLM pricing per 1M tokens: (input, output)
+        llm_prices = {
+            "gpt-5.1": (1.25, 10.00), "gpt-5": (1.25, 10.00),
+            "gpt-5-pro": (15.00, 120.00), "gpt-5-mini": (0.25, 2.00),
+            "gpt-5-nano": (0.05, 0.40),
+            "gpt-4.1": (2.00, 8.00), "gpt-4.1-mini": (0.40, 1.60),
+            "gpt-4.1-nano": (0.10, 0.40),
+            "gpt-4o": (2.50, 10.00), "gpt-4o-mini": (0.15, 0.60),
+            "o4-mini": (1.10, 4.40), "o3": (2.00, 8.00),
+            "o3-mini": (1.10, 4.40), "o1": (15.00, 60.00),
+            "o1-pro": (150.00, 600.00),
+            "gpt-4-turbo": (10.00, 30.00), "gpt-4": (30.00, 60.00),
+            "gpt-3.5-turbo": (0.50, 1.50),
+        }
+
+        # TTS pricing per 1M characters
+        tts_prices = {"tts-1": 15.0, "tts-1-hd": 30.0, "gpt-4o-mini-tts": 12.0}
+
+        # Estimated tokens per call (approximations)
+        # Narrator: ~500 input, ~150 output
+        # Interpreter: ~300 input, ~50 output
+        # Suggestions: ~200 input, ~50 output
+        # TTS: ~500 characters per response
+
+        narrator_in, narrator_out = llm_prices.get(config.narrator_model, (0.15, 0.60))
+        interp_in, interp_out = llm_prices.get(config.interpreter_model, (0.15, 0.60))
+        suggest_in, suggest_out = llm_prices.get(config.suggestions_model, (0.15, 0.60))
+        tts_price = tts_prices.get(config.tts_model, 15.0)
+
+        # Per-message costs (in dollars)
+        narrator_cost = (500 * narrator_in + 150 * narrator_out) / 1_000_000
+        interp_cost = (300 * interp_in + 50 * interp_out) / 1_000_000
+        suggest_cost = (200 * suggest_in + 50 * suggest_out) / 1_000_000
+        tts_cost = (500 * tts_price) / 1_000_000 if config.tts_enabled else 0
+
+        total = narrator_cost + interp_cost + suggest_cost + tts_cost
+
+        return (
+            f"[dim]Est. per action: [#0f9]${total:.4f}[/]\n"
+            f"  Narrator: ${narrator_cost:.5f}\n"
+            f"  Interpreter: ${interp_cost:.5f}\n"
+            f"  Suggestions: ${suggest_cost:.5f}\n"
+            f"  TTS: ${tts_cost:.5f}[/]"
+        )
+
+    def _update_cost_estimate(self) -> None:
+        """Update the cost estimate display."""
+        try:
+            cost_display = self.query_one("#cost-estimate", Static)
+            cost_display.update(self._get_cost_estimate())
+        except:
+            pass
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        """Handle dropdown changes."""
+        config = get_config()
+        select_id = event.select.id
+        value = event.value
+
+        # Ignore blank/empty selections
+        if value == Select.BLANK:
+            return
+
+        if select_id == "narrator-model-select":
+            config.narrator_model = value
+            self._update_cost_estimate()
+        elif select_id == "interpreter-model-select":
+            config.interpreter_model = value
+            self._update_cost_estimate()
+        elif select_id == "suggestions-model-select":
+            config.suggestions_model = value
+            self._update_cost_estimate()
+        elif select_id == "tts-model-select":
+            config.tts_model = value
+            self._update_cost_estimate()
+        elif select_id == "tts-voice-select":
+            tts = get_tts()
+            tts.set_voice(value)
+
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        """Handle switch changes."""
+        if event.switch.id == "tts-enabled-switch":
+            tts = get_tts()
+            tts.set_enabled(event.value)
+            self._update_cost_estimate()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        button_id = event.button.id
+
+        if button_id == "settings-close":
+            self.app.pop_screen()
+        elif button_id == "settings-tts-slower":
+            tts = get_tts()
+            new_rate = tts.adjust_speed(-25)
+            self.query_one("#tts-speed-display", Static).update(str(new_rate))
+        elif button_id == "settings-tts-faster":
+            tts = get_tts()
+            new_rate = tts.adjust_speed(25)
+            self.query_one("#tts-speed-display", Static).update(str(new_rate))
+
+    def action_close_settings(self) -> None:
+        """Close settings screen."""
+        self.app.pop_screen()
 
 
 class RPGApp(App):
@@ -241,6 +529,7 @@ class RPGApp(App):
 
     #action-input {
         width: 1fr;
+        height: 4;
         background: #0f0f23;
         border: round #0f9;
         color: #fff;
@@ -253,7 +542,7 @@ class RPGApp(App):
     .suggestion-btn {
         width: 1fr;
         min-width: 20;
-        height: 3;
+        height: 4;
         margin-left: 1;
         background: #0f0f23;
         border: round #444;
@@ -304,13 +593,7 @@ class RPGApp(App):
         display: none;
     }
 
-    #tts-controls {
-        width: auto;
-        height: 3;
-        align: center middle;
-    }
-
-    #tts-slower, #tts-faster, #tts-voice {
+    #settings-btn {
         width: 3;
         min-width: 3;
         height: 3;
@@ -320,17 +603,8 @@ class RPGApp(App):
         padding: 0;
     }
 
-    #tts-slower:hover, #tts-faster:hover, #tts-voice:hover {
+    #settings-btn:hover {
         background: #666;
-    }
-
-    #tts-speed {
-        width: 5;
-        height: 3;
-        content-align: center middle;
-        background: #222;
-        color: #0af;
-        padding: 0 1;
     }
 
     .dim {
@@ -564,6 +838,7 @@ class RPGApp(App):
     BINDINGS = [
         Binding("ctrl+z", "undo", "Undo"),
         Binding("ctrl+t", "toggle_tts", "Toggle TTS"),
+        Binding("ctrl+s", "open_settings", "Settings"),
         Binding("escape", "quit", "Quit"),
         Binding("ctrl+left", "focus_previous", "Previous", show=False),
         Binding("ctrl+right", "focus_next", "Next", show=False),
@@ -672,19 +947,13 @@ class RPGApp(App):
             ScrollableContainer(Static("", id="story-content"), id="story-scroll"),
             Static("", id="roll-bar"),
             Horizontal(
-                Input(placeholder="What do you do?", id="action-input"),
+                TextArea(id="action-input"),
                 Button("...", id="suggestion-1", classes="suggestion-btn"),
                 Button("...", id="suggestion-2", classes="suggestion-btn"),
                 Button("...", id="suggestion-3", classes="suggestion-btn"),
                 Button("Undo", id="undo-btn"),
                 Button("Force!", id="force-btn", classes="hidden"),
-                Horizontal(
-                    Button("◀", id="tts-slower"),
-                    Static("200", id="tts-speed"),
-                    Button("▶", id="tts-faster"),
-                    Button("🎤", id="tts-voice"),
-                    id="tts-controls"
-                ),
+                Button("⚙", id="settings-btn"),
                 id="input-row"
             ),
             id="main-container",
@@ -762,11 +1031,13 @@ class RPGApp(App):
 
     def update_stats_bar(self) -> None:
         bar = self.query_one("#stats-bar", Static)
+        cost = get_config().get_session_cost()
         bar.update(
             f"[bold #0f9]{self.character}[/]  │  "
             f"[#0af]Mind[/] {self.stats['mind']}  "
             f"[#fa0]Body[/] {self.stats['body']}  "
-            f"[#f0a]Spirit[/] {self.stats['spirit']}"
+            f"[#f0a]Spirit[/] {self.stats['spirit']}  │  "
+            f"[dim]${cost:.4f}[/]"
         )
 
     def update_suggestions(self, suggestions: list[str]) -> None:
@@ -782,25 +1053,38 @@ class RPGApp(App):
         self._scroll_timer = self.set_interval(0.15, self._scroll_suggestions)
 
     def _scroll_suggestions(self) -> None:
-        """Scroll text in suggestion buttons like a news ticker."""
+        """Scroll text in suggestion buttons, snaking across 2 rows."""
         for i, suggestion in enumerate(self.suggestions):
             try:
                 btn = self.query_one(f"#suggestion-{i + 1}", Button)
 
                 # Calculate max width based on button's actual size (subtract padding)
-                # Button width in cells minus padding (2 chars for padding)
                 max_width = max(20, btn.size.width - 4)
+                # Total chars visible across 2 rows
+                total_visible = max_width * 2
 
-                if len(suggestion) <= max_width:
-                    # Short enough, no scrolling needed
-                    display_text = suggestion
+                if len(suggestion) <= total_visible:
+                    # Short enough to fit in 2 rows, no scrolling needed
+                    if len(suggestion) <= max_width:
+                        # Fits in one row
+                        display_text = suggestion
+                    else:
+                        # Split across 2 rows
+                        row1 = suggestion[:max_width]
+                        row2 = suggestion[max_width:max_width * 2]
+                        display_text = row1 + "\n" + row2
                 else:
-                    # Scroll the text
+                    # Scroll the text across 2 rows
                     pos = self._scroll_positions[i]
                     # Add spacing between end and start
                     padded = suggestion + "   ...   "
-                    # Circular scroll
-                    display_text = (padded * 2)[pos:pos + max_width]
+                    # Get visible portion (2 rows worth)
+                    extended = padded * 3  # Ensure enough chars
+                    visible = extended[pos:pos + total_visible]
+                    # Split into 2 rows
+                    row1 = visible[:max_width]
+                    row2 = visible[max_width:total_visible]
+                    display_text = row1 + "\n" + row2
                     # Advance position
                     self._scroll_positions[i] = (pos + 1) % len(padded)
 
@@ -845,13 +1129,7 @@ class RPGApp(App):
             self.query_one("#char-display", Static).update(f"[bold]{self.character}[/]")
             return
 
-        # Handle game action input
-        if event.input.id == "action-input":
-            input_widget = self.query_one("#action-input", Input)
-            input_widget.value = ""
-
-            if self.alive:
-                self.handle_action(action)
+        # Note: game action input is now handled via on_key for TextArea
 
     def start_game(self) -> None:
         """Transition from stat allocation to the actual game."""
@@ -888,8 +1166,11 @@ class RPGApp(App):
         tts = get_tts()
         tts.speak(self.context, blocking=False, interrupt=True)
 
+        # Update cost display after LLM calls and TTS chars are added
+        self.update_stats_bar()
+
         # Focus the action input
-        self.query_one("#action-input", Input).focus()
+        self.query_one("#action-input", TextArea).focus()
 
     def handle_action(self, action: str) -> None:
         """Start the async action handler."""
@@ -899,7 +1180,7 @@ class RPGApp(App):
         story = self.query_one("#story-content", Static)
         roll_bar = self.query_one("#roll-bar", Static)
         force_btn = self.query_one("#force-btn", Button)
-        input_widget = self.query_one("#action-input", Input)
+        input_widget = self.query_one("#action-input", TextArea)
         input_widget.disabled = True
 
         god_mode = False
@@ -1016,6 +1297,9 @@ class RPGApp(App):
         tts = get_tts()
         tts.speak(self.context, blocking=False, interrupt=True)
 
+        # Update cost display (after TTS chars are added)
+        self.update_stats_bar()
+
         if died:
             self.alive = False
             roll_bar.update(f"{self.last_roll_text}  │  [bold #f00]GAME OVER[/]")
@@ -1030,6 +1314,22 @@ class RPGApp(App):
     def scroll_story(self) -> None:
         container = self.query_one("#story-scroll", ScrollableContainer)
         container.scroll_end(animate=False)
+
+    def on_key(self, event) -> None:
+        """Handle key presses for TextArea submission."""
+        # Submit on Enter
+        if event.key == "enter":
+            try:
+                input_widget = self.query_one("#action-input", TextArea)
+                if input_widget.has_focus:
+                    action = input_widget.text.strip()
+                    if action and self.alive and self.game_started:
+                        input_widget.text = ""
+                        self.handle_action(action)
+                        event.prevent_default()
+                        event.stop()
+            except Exception:
+                pass  # Widget not mounted or wrong screen
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
@@ -1059,9 +1359,7 @@ class RPGApp(App):
             self.action_undo()
         elif button_id == "force-btn":
             if self.last_action and self.last_invalid:
-                input_widget = self.query_one("#action-input", Input)
-                input_widget.value = "!"
-                input_widget.action_submit()
+                self.handle_action("!")
 
         # Suggestion buttons
         elif button_id == "suggestion-1":
@@ -1071,20 +1369,9 @@ class RPGApp(App):
         elif button_id == "suggestion-3":
             self.handle_action(self.suggestions[2])
 
-        # TTS speed controls
-        elif button_id == "tts-slower":
-            tts = get_tts()
-            new_rate = tts.adjust_speed(-25)
-            self.query_one("#tts-speed", Static).update(str(new_rate))
-        elif button_id == "tts-faster":
-            tts = get_tts()
-            new_rate = tts.adjust_speed(25)
-            self.query_one("#tts-speed", Static).update(str(new_rate))
-        elif button_id == "tts-voice":
-            tts = get_tts()
-            voice_name = tts.cycle_voice()
-            roll_bar = self.query_one("#roll-bar", Static)
-            roll_bar.update(f"Voice: [#0af]{voice_name}[/]")
+        # Settings button
+        elif button_id == "settings-btn":
+            self.action_open_settings()
 
     def action_undo(self) -> None:
         if self.history:
@@ -1102,6 +1389,10 @@ class RPGApp(App):
         roll_bar = self.query_one("#roll-bar", Static)
         status = "[#0f0]ON[/]" if enabled else "[#f00]OFF[/]"
         roll_bar.update(f"TTS: {status}")
+
+    def action_open_settings(self) -> None:
+        """Open settings screen."""
+        self.push_screen(SettingsScreen())
 
 
 if __name__ == "__main__":
