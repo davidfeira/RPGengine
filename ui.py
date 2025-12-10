@@ -11,6 +11,7 @@ import logging
 import asyncio
 from openai import OpenAI
 from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT
+from tts import get_tts
 
 STAT_COLORS = {"mind": "#0af", "body": "#fa0", "spirit": "#f0a"}
 
@@ -240,6 +241,35 @@ class RPGApp(App):
 
     #force-btn.hidden {
         display: none;
+    }
+
+    #tts-controls {
+        width: auto;
+        height: 3;
+        align: center middle;
+    }
+
+    #tts-slower, #tts-faster, #tts-voice {
+        width: 3;
+        min-width: 3;
+        height: 3;
+        background: #444;
+        color: #fff;
+        border: none;
+        padding: 0;
+    }
+
+    #tts-slower:hover, #tts-faster:hover, #tts-voice:hover {
+        background: #666;
+    }
+
+    #tts-speed {
+        width: 5;
+        height: 3;
+        content-align: center middle;
+        background: #222;
+        color: #0af;
+        padding: 0 1;
     }
 
     .dim {
@@ -472,6 +502,7 @@ class RPGApp(App):
 
     BINDINGS = [
         Binding("ctrl+z", "undo", "Undo"),
+        Binding("ctrl+t", "toggle_tts", "Toggle TTS"),
         Binding("escape", "quit", "Quit"),
     ]
 
@@ -494,6 +525,9 @@ class RPGApp(App):
         self.alive = True
         self.game_started = False
         self._prompt_animation_task = None
+
+        # Initialize TTS (enabled by default)
+        get_tts().set_enabled(True)
 
         # Check if API key is already set
         existing_key = get_api_key()
@@ -575,6 +609,13 @@ class RPGApp(App):
                 Input(placeholder="What do you do?", id="action-input"),
                 Button("Undo", id="undo-btn"),
                 Button("Force!", id="force-btn", classes="hidden"),
+                Horizontal(
+                    Button("◀", id="tts-slower"),
+                    Static("175", id="tts-speed"),
+                    Button("▶", id="tts-faster"),
+                    Button("🎤", id="tts-voice"),
+                    id="tts-controls"
+                ),
                 id="input-row"
             ),
             id="main-container",
@@ -731,6 +772,9 @@ class RPGApp(App):
         story.update(self.context)
         self.scroll_story()
 
+        # Speak the opening scene (non-blocking)
+        get_tts().speak(self.context, blocking=False)
+
         # Focus the action input
         self.query_one("#action-input", Input).focus()
 
@@ -744,6 +788,9 @@ class RPGApp(App):
         force_btn = self.query_one("#force-btn", Button)
         input_widget = self.query_one("#action-input", Input)
         input_widget.disabled = True
+
+        # Stop any ongoing TTS when taking a new action
+        get_tts().stop()
 
         god_mode = False
         if action.lower().startswith("/god "):
@@ -837,6 +884,9 @@ class RPGApp(App):
         story.update(self.context)
         self.scroll_story()
 
+        # Speak the narrative (non-blocking)
+        get_tts().speak(self.context, blocking=False)
+
         if died:
             self.alive = False
             roll_bar.update(f"{self.last_roll_text}  │  [bold #f00]GAME OVER[/]")
@@ -880,6 +930,21 @@ class RPGApp(App):
                 input_widget.value = "!"
                 input_widget.action_submit()
 
+        # TTS speed controls
+        elif button_id == "tts-slower":
+            tts = get_tts()
+            new_rate = tts.adjust_speed(-25)
+            self.query_one("#tts-speed", Static).update(str(new_rate))
+        elif button_id == "tts-faster":
+            tts = get_tts()
+            new_rate = tts.adjust_speed(25)
+            self.query_one("#tts-speed", Static).update(str(new_rate))
+        elif button_id == "tts-voice":
+            tts = get_tts()
+            voice_name = tts.cycle_voice()
+            roll_bar = self.query_one("#roll-bar", Static)
+            roll_bar.update(f"Voice: [#0af]{voice_name}[/]")
+
     def action_undo(self) -> None:
         if self.history:
             self.context, self.last_roll_text = self.history.pop()
@@ -888,6 +953,14 @@ class RPGApp(App):
             self.alive = True
             self.query_one("#force-btn", Button).add_class("hidden")
             self.scroll_story()
+
+    def action_toggle_tts(self) -> None:
+        """Toggle TTS on/off."""
+        tts = get_tts()
+        enabled = tts.toggle()
+        roll_bar = self.query_one("#roll-bar", Static)
+        status = "[#0f0]ON[/]" if enabled else "[#f00]OFF[/]"
+        roll_bar.update(f"TTS: {status}")
 
 
 if __name__ == "__main__":
