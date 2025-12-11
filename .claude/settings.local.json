@@ -17,7 +17,16 @@
       "Bash(git -C c:UsersdavidprojectsRPGengine rm --cached rpg_engine.log)",
       "Bash(git rm:*)",
       "Bash(type c:UsersdavidprojectsRPGengine*.log)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(git -C /c/Users/david/projects/RPGengine log --oneline)",
+      "Bash(c:UsersdavidprojectsRPGenginevenvScriptspip.exe install -r c:UsersdavidprojectsRPGenginerequirements.txt)",
+      "Bash(python -m py_compile:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(wmic:*)",
+      "Bash(powershell:*)",
+      "Bash(c:UsersdavidprojectsRPGengine.venvScriptspython.exe:*)"
     ],
     "deny": [],
     "ask": []

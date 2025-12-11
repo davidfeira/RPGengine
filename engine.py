@@ -48,9 +48,9 @@ def call_llm(prompt: str, system: str = None, json_mode: bool = False, task: str
 
     response = client.chat.completions.create(**kwargs)
 
-    # Track token usage
+    # Track token usage by task type
     if response.usage:
-        config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
+        config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens, task)
 
     return response.choices[0].message.content
 

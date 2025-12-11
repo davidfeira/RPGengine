@@ -53,15 +53,67 @@ TTS_VOICES = [
     "shimmer",
 ]
 
+# TTS engines available
+TTS_ENGINES = ["openai", "edge"]
+
+# Image generation models (sd-1.5 is local/free, gpt-image-1-mini is cheapest API)
+IMAGE_MODELS = ["sd-1.5 (local)", "gpt-image-1-mini", "gpt-image-1", "dall-e-3", "dall-e-2"]
+
+# Image quality options
+IMAGE_QUALITIES = ["low", "medium", "high"]
+
+# Local SD resolution options (width x height)
+LOCAL_RESOLUTIONS = ["512x512", "512x768", "768x512", "768x768"]
+
+# Local SD guidance scale presets
+LOCAL_GUIDANCE = ["low (5)", "medium (7.5)", "high (10)", "very high (15)"]
+
+# Default image styles
+IMAGE_STYLES = [
+    "fantasy illustration, detailed",
+    "dark fantasy art, moody",
+    "pixel art, retro game style",
+    "watercolor painting",
+    "comic book style",
+    "oil painting, classical",
+    "anime style",
+    "realistic, photographic",
+]
+
+# Edge TTS voices (curated list of good narrator voices)
+EDGE_VOICES = [
+    "en-US-GuyNeural",           # Male, casual
+    "en-US-ChristopherNeural",   # Male, formal
+    "en-US-EricNeural",          # Male, warm
+    "en-US-AndrewNeural",        # Male, expressive
+    "en-US-JennyNeural",         # Female, casual
+    "en-US-AriaNeural",          # Female, professional
+    "en-US-SaraNeural",          # Female, warm
+    "en-US-MichelleNeural",      # Female, expressive
+    "en-GB-RyanNeural",          # British male
+    "en-GB-SoniaNeural",         # British female
+]
+
 # Default settings
 DEFAULTS = {
     "narrator_model": "gpt-4o-mini",
     "interpreter_model": "gpt-4o-mini",
     "suggestions_model": "gpt-4o-mini",
     "tts_enabled": True,
+    "tts_engine": "openai",  # "openai" or "edge"
     "tts_model": "tts-1",
     "tts_voice": "onyx",
     "tts_speed": 1.0,  # OpenAI scale: 0.25-4.0
+    "edge_voice": "en-US-GuyNeural",  # Edge TTS voice
+    # Image generation settings
+    "image_enabled": False,  # Disabled by default
+    "image_model": "dall-e-3",
+    "image_quality": "low",  # low = $0.01/image
+    "image_style": "fantasy illustration, detailed",
+    # Local SD settings
+    "local_resolution": "512x512",
+    "local_guidance": "medium (7.5)",
+    "local_negative_prompt": "blurry, bad anatomy, ugly, deformed",
 }
 
 
@@ -72,8 +124,14 @@ class Config:
 
     def __init__(self):
         self._settings = DEFAULTS.copy()
-        self._session_tokens = {"prompt": 0, "completion": 0}
+        # Track tokens per task type for accurate cost calculation
+        self._session_tokens = {
+            "narrator": {"prompt": 0, "completion": 0},
+            "interpreter": {"prompt": 0, "completion": 0},
+            "suggestions": {"prompt": 0, "completion": 0},
+        }
         self._session_tts_chars = 0
+        self._session_images = 0
         self._load()
 
     @classmethod
@@ -145,6 +203,16 @@ class Config:
         self._settings["tts_enabled"] = value
         self.save()
 
+    # TTS engine
+    @property
+    def tts_engine(self) -> str:
+        return self._settings.get("tts_engine", "openai")
+
+    @tts_engine.setter
+    def tts_engine(self, value: str):
+        self._settings["tts_engine"] = value
+        self.save()
+
     # TTS model
     @property
     def tts_model(self) -> str:
@@ -175,19 +243,118 @@ class Config:
         self._settings["tts_speed"] = max(0.25, min(4.0, value))
         self.save()
 
+    # Edge TTS voice
+    @property
+    def edge_voice(self) -> str:
+        return self._settings.get("edge_voice", "en-US-GuyNeural")
+
+    @edge_voice.setter
+    def edge_voice(self, value: str):
+        self._settings["edge_voice"] = value
+        self.save()
+
+    # Image generation enabled
+    @property
+    def image_enabled(self) -> bool:
+        return self._settings.get("image_enabled", False)
+
+    @image_enabled.setter
+    def image_enabled(self, value: bool):
+        self._settings["image_enabled"] = value
+        self.save()
+
+    # Image model
+    @property
+    def image_model(self) -> str:
+        return self._settings.get("image_model", "dall-e-3")
+
+    @image_model.setter
+    def image_model(self, value: str):
+        self._settings["image_model"] = value
+        self.save()
+
+    # Image quality
+    @property
+    def image_quality(self) -> str:
+        return self._settings.get("image_quality", "low")
+
+    @image_quality.setter
+    def image_quality(self, value: str):
+        self._settings["image_quality"] = value
+        self.save()
+
+    # Image style
+    @property
+    def image_style(self) -> str:
+        return self._settings.get("image_style", "fantasy illustration, detailed")
+
+    @image_style.setter
+    def image_style(self, value: str):
+        self._settings["image_style"] = value
+        self.save()
+
+    # Local SD resolution
+    @property
+    def local_resolution(self) -> str:
+        return self._settings.get("local_resolution", "512x512")
+
+    @local_resolution.setter
+    def local_resolution(self, value: str):
+        self._settings["local_resolution"] = value
+        self.save()
+
+    # Local SD guidance scale
+    @property
+    def local_guidance(self) -> str:
+        return self._settings.get("local_guidance", "medium (7.5)")
+
+    @local_guidance.setter
+    def local_guidance(self, value: str):
+        self._settings["local_guidance"] = value
+        self.save()
+
+    # Local SD negative prompt
+    @property
+    def local_negative_prompt(self) -> str:
+        return self._settings.get("local_negative_prompt", "blurry, bad anatomy, ugly, deformed")
+
+    @local_negative_prompt.setter
+    def local_negative_prompt(self, value: str):
+        self._settings["local_negative_prompt"] = value
+        self.save()
+
     # Session token tracking (not persisted - resets each run)
-    def add_tokens(self, prompt: int, completion: int):
-        """Add tokens from an API call to the session total."""
-        self._session_tokens["prompt"] += prompt
-        self._session_tokens["completion"] += completion
+    def add_tokens(self, prompt: int, completion: int, task: str = "narrator"):
+        """Add tokens from an API call to the session total.
+
+        Args:
+            prompt: Number of prompt tokens used
+            completion: Number of completion tokens used
+            task: "narrator", "interpreter", or "suggestions"
+        """
+        if task not in self._session_tokens:
+            task = "narrator"
+        self._session_tokens[task]["prompt"] += prompt
+        self._session_tokens[task]["completion"] += completion
 
     def add_tts_chars(self, chars: int):
         """Add TTS characters to the session total."""
         self._session_tts_chars += chars
 
+    def add_image(self):
+        """Add one image generation to the session total."""
+        self._session_images += 1
+
+    def get_session_images(self) -> int:
+        """Get the current session image count."""
+        return self._session_images
+
     def get_session_tokens(self) -> dict:
-        """Get the current session token counts."""
-        return self._session_tokens.copy()
+        """Get the current session token counts by task type."""
+        return {
+            task: counts.copy()
+            for task, counts in self._session_tokens.items()
+        }
 
     def get_session_cost(self) -> float:
         """Calculate approximate session cost based on token and TTS usage.
@@ -221,26 +388,57 @@ class Config:
             "gpt-3.5-turbo": (0.50, 1.50),
         }
 
-        # Get price for current narrator model (used for most calls)
-        input_price, output_price = llm_prices.get(self.narrator_model, (0.15, 0.60))
-        prompt_cost = self._session_tokens["prompt"] / 1_000_000 * input_price
-        completion_cost = self._session_tokens["completion"] / 1_000_000 * output_price
-
-        # TTS pricing per 1M characters
-        tts_prices = {
-            "tts-1": 15.0,
-            "tts-1-hd": 30.0,
-            "gpt-4o-mini-tts": 12.0,  # $12/1M audio output tokens (~$0.015/min)
+        # Calculate cost for each task type using its configured model
+        llm_cost = 0.0
+        task_models = {
+            "narrator": self.narrator_model,
+            "interpreter": self.interpreter_model,
+            "suggestions": self.suggestions_model,
         }
-        tts_price = tts_prices.get(self.tts_model, 15.0)
-        tts_cost = self._session_tts_chars / 1_000_000 * tts_price
+        for task, model in task_models.items():
+            tokens = self._session_tokens[task]
+            input_price, output_price = llm_prices.get(model, (0.15, 0.60))
+            llm_cost += tokens["prompt"] / 1_000_000 * input_price
+            llm_cost += tokens["completion"] / 1_000_000 * output_price
 
-        return prompt_cost + completion_cost + tts_cost
+        # TTS pricing per 1M characters (Edge TTS is free)
+        if self.tts_engine == "edge":
+            tts_cost = 0.0
+        else:
+            tts_prices = {
+                "tts-1": 15.0,
+                "tts-1-hd": 30.0,
+                "gpt-4o-mini-tts": 12.0,
+            }
+            tts_price = tts_prices.get(self.tts_model, 15.0)
+            tts_cost = self._session_tts_chars / 1_000_000 * tts_price
+
+        # Image generation pricing per image (square 1024x1024)
+        # Local models (sd-1.5) are free
+        if "local" in self.image_model.lower():
+            image_cost = 0.0
+        else:
+            image_prices = {
+                "gpt-image-1-mini": {"low": 0.001, "medium": 0.003, "high": 0.013},
+                "gpt-image-1": {"low": 0.01, "medium": 0.04, "high": 0.17},
+                "dall-e-3": {"low": 0.04, "medium": 0.08, "high": 0.12},
+                "dall-e-2": {"low": 0.02, "medium": 0.02, "high": 0.02},
+            }
+            model_prices = image_prices.get(self.image_model, {"low": 0.01, "medium": 0.04, "high": 0.17})
+            image_price = model_prices.get(self.image_quality, 0.01)
+            image_cost = self._session_images * image_price
+
+        return llm_cost + tts_cost + image_cost
 
     def reset_session_tokens(self):
         """Reset the session token counters."""
-        self._session_tokens = {"prompt": 0, "completion": 0}
+        self._session_tokens = {
+            "narrator": {"prompt": 0, "completion": 0},
+            "interpreter": {"prompt": 0, "completion": 0},
+            "suggestions": {"prompt": 0, "completion": 0},
+        }
         self._session_tts_chars = 0
+        self._session_images = 0
 
 
 def get_config() -> Config:

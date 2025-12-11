@@ -10,10 +10,29 @@ import json
 import os
 import logging
 import asyncio
+from io import BytesIO
 from openai import OpenAI
 from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
 from tts import get_tts
-from config import get_config, LLM_MODELS, TTS_MODELS, TTS_VOICES
+from config import get_config, LLM_MODELS, TTS_MODELS, TTS_VOICES, TTS_ENGINES, EDGE_VOICES, IMAGE_MODELS, IMAGE_QUALITIES, IMAGE_STYLES, LOCAL_RESOLUTIONS, LOCAL_GUIDANCE
+from image_gen import generate_scene_image, preload_local_model, is_local_model_ready, is_local_model, generate_test_image
+
+# Try to import textual-image, fall back gracefully if not available
+# Note: textual-image has issues on Windows Terminal - we need to pre-fill the cell size cache
+# to avoid the terminal escape sequence timeout
+IMAGES_AVAILABLE = False
+ImageWidget = None
+try:
+    # Pre-fill the cell size cache to avoid timeout on Windows
+    from textual_image._terminal import get_cell_size, CellSize
+    # Set a default cell size (10x20 is VT340 standard) to skip terminal detection
+    setattr(get_cell_size, "_result", CellSize(10, 20))
+
+    # Now we can safely import the widget
+    from textual_image.widget import HalfcellImage as ImageWidget
+    IMAGES_AVAILABLE = True
+except (ImportError, Exception) as e:
+    logging.warning(f"textual-image not available: {e}")
 
 STAT_COLORS = {"mind": "#0af", "body": "#fa0", "spirit": "#f0a"}
 
@@ -83,9 +102,9 @@ def call_llm(prompt: str, system: str = None, json_mode: bool = False, task: str
     try:
         response = client.chat.completions.create(**kwargs)
 
-        # Track token usage
+        # Track token usage by task type
         if response.usage:
-            config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens)
+            config.add_tokens(response.usage.prompt_tokens, response.usage.completion_tokens, task)
 
         result = response.choices[0].message.content
         logger.debug(f"LLM response: {result[:200]}...")
@@ -200,7 +219,7 @@ IDENTITY_PROMPTS = [
 
 
 class SettingsScreen(ModalScreen):
-    """Modal screen for settings."""
+    """Modal screen for settings - compact two-column layout."""
 
     CSS = """
     SettingsScreen {
@@ -208,7 +227,7 @@ class SettingsScreen(ModalScreen):
     }
 
     #settings-container {
-        width: 64;
+        width: 100;
         height: auto;
         background: #1a1a2e;
         border: solid #0af;
@@ -222,13 +241,19 @@ class SettingsScreen(ModalScreen):
         margin-bottom: 1;
     }
 
-    .settings-section {
-        margin-bottom: 1;
+    #settings-columns {
+        height: auto;
+    }
+
+    .settings-column {
+        width: 1fr;
+        padding: 0 1;
     }
 
     .settings-section-title {
         color: #fa0;
         text-style: bold;
+        margin-bottom: 0;
     }
 
     .settings-row {
@@ -236,52 +261,88 @@ class SettingsScreen(ModalScreen):
     }
 
     .settings-label {
-        width: 16;
+        width: 12;
         padding-top: 1;
     }
 
-    .settings-select {
-        width: 40;
+    .settings-control {
+        width: 1fr;
     }
 
-    #settings-close {
-        margin-top: 1;
+    .compact-select {
         width: 100%;
     }
 
-    #tts-speed-row {
-        height: 3;
-    }
-
-    #tts-speed-label {
-        width: 16;
-        padding-top: 1;
-    }
-
-    #tts-speed-controls {
-        width: 40;
-    }
-
-    .speed-btn {
-        width: 5;
-        min-width: 5;
-    }
-
-    #tts-speed-display {
-        width: 8;
-        text-align: center;
+    #settings-footer {
+        height: auto;
+        margin-top: 1;
+        border-top: solid #333;
         padding-top: 1;
     }
 
     #cost-estimate {
+        width: 1fr;
         color: #888;
-        padding-left: 2;
+    }
+
+    #settings-close {
+        width: 16;
+    }
+
+    .speed-btn {
+        width: 4;
+        min-width: 4;
+        height: 3;
+    }
+
+    #tts-speed-display {
+        width: 6;
+        text-align: center;
+        padding-top: 1;
+    }
+
+    #tts-speed-controls {
+        width: 1fr;
+    }
+
+    .local-sd-row {
+        height: 3;
+    }
+
+    #local-negative-input {
+        width: 100%;
+        height: 3;
+        background: #16213e;
+        border: round #444;
+    }
+
+    #test-image-row {
+        height: auto;
+        margin-top: 1;
+    }
+
+    #test-image-btn {
+        width: 14;
+        min-width: 14;
+    }
+
+    #test-image-result {
+        width: 1fr;
+        padding-left: 1;
+        padding-top: 1;
+        color: #888;
     }
     """
 
     BINDINGS = [
         Binding("escape", "close_settings", "Close"),
     ]
+
+    def on_mount(self) -> None:
+        """Initialize UI state based on current config."""
+        self._update_model_row_visibility()
+        self._update_local_sd_visibility()
+        self._update_cost_estimate()
 
     def compose(self) -> ComposeResult:
         config = get_config()
@@ -290,74 +351,108 @@ class SettingsScreen(ModalScreen):
         # Build model options
         llm_options = [(m, m) for m in LLM_MODELS]
         tts_model_options = [(m, m) for m in TTS_MODELS]
-        voice_options = [(v.capitalize(), v) for v in TTS_VOICES]
+        engine_options = [("OpenAI", "openai"), ("Edge (free)", "edge")]
+
+        # Voice options depend on engine
+        if config.tts_engine == "edge":
+            voice_options = [(v.split("-")[2].replace("Neural", ""), v) for v in EDGE_VOICES]
+            current_voice = config.edge_voice
+        else:
+            voice_options = [(v.capitalize(), v) for v in TTS_VOICES]
+            current_voice = config.tts_voice
 
         with Container(id="settings-container"):
             yield Static("⚙ SETTINGS", id="settings-title")
 
-            # LLM Models section
-            with Vertical(classes="settings-section"):
-                yield Static("LLM Models", classes="settings-section-title")
-                with Horizontal(classes="settings-row"):
-                    yield Static("Narrator:", classes="settings-label")
-                    yield Select(
-                        llm_options,
-                        value=config.narrator_model,
-                        id="narrator-model-select",
-                        classes="settings-select"
-                    )
-                with Horizontal(classes="settings-row"):
-                    yield Static("Interpreter:", classes="settings-label")
-                    yield Select(
-                        llm_options,
-                        value=config.interpreter_model,
-                        id="interpreter-model-select",
-                        classes="settings-select"
-                    )
-                with Horizontal(classes="settings-row"):
-                    yield Static("Suggestions:", classes="settings-label")
-                    yield Select(
-                        llm_options,
-                        value=config.suggestions_model,
-                        id="suggestions-model-select",
-                        classes="settings-select"
-                    )
+            # Two-column layout
+            with Horizontal(id="settings-columns"):
+                # LEFT COLUMN: LLM + TTS
+                with Vertical(classes="settings-column"):
+                    yield Static("LLM Models", classes="settings-section-title")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Narrator:", classes="settings-label")
+                        yield Select(llm_options, value=config.narrator_model,
+                                     id="narrator-model-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Interpreter:", classes="settings-label")
+                        yield Select(llm_options, value=config.interpreter_model,
+                                     id="interpreter-model-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Suggestions:", classes="settings-label")
+                        yield Select(llm_options, value=config.suggestions_model,
+                                     id="suggestions-model-select", classes="compact-select")
 
-            # TTS section
-            with Vertical(classes="settings-section"):
-                yield Static("Text-to-Speech", classes="settings-section-title")
-                with Horizontal(classes="settings-row"):
-                    yield Static("Enabled:", classes="settings-label")
-                    yield Switch(value=config.tts_enabled, id="tts-enabled-switch")
-                with Horizontal(classes="settings-row"):
-                    yield Static("Model:", classes="settings-label")
-                    yield Select(
-                        tts_model_options,
-                        value=config.tts_model,
-                        id="tts-model-select",
-                        classes="settings-select"
-                    )
-                with Horizontal(classes="settings-row"):
-                    yield Static("Voice:", classes="settings-label")
-                    yield Select(
-                        voice_options,
-                        value=config.tts_voice,
-                        id="tts-voice-select",
-                        classes="settings-select"
-                    )
-                with Horizontal(id="tts-speed-row"):
-                    yield Static("Speed:", id="tts-speed-label")
-                    with Horizontal(id="tts-speed-controls"):
-                        yield Button("◀", id="settings-tts-slower", classes="speed-btn")
-                        yield Static(str(tts.get_speed()), id="tts-speed-display")
-                        yield Button("▶", id="settings-tts-faster", classes="speed-btn")
+                    yield Static("Text-to-Speech", classes="settings-section-title")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Enabled:", classes="settings-label")
+                        yield Switch(value=config.tts_enabled, id="tts-enabled-switch")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Engine:", classes="settings-label")
+                        yield Select(engine_options, value=config.tts_engine,
+                                     id="tts-engine-select", classes="compact-select")
+                    with Horizontal(classes="settings-row", id="tts-model-row"):
+                        yield Static("Model:", classes="settings-label")
+                        yield Select(tts_model_options, value=config.tts_model,
+                                     id="tts-model-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Voice:", classes="settings-label")
+                        yield Select(voice_options, value=current_voice,
+                                     id="tts-voice-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Speed:", classes="settings-label")
+                        with Horizontal(id="tts-speed-controls"):
+                            yield Button("-", id="settings-tts-slower", classes="speed-btn")
+                            yield Static(str(tts.get_speed()), id="tts-speed-display")
+                            yield Button("+", id="settings-tts-faster", classes="speed-btn")
 
-            # Cost estimate section
-            with Vertical(classes="settings-section"):
-                yield Static("Cost Estimate", classes="settings-section-title")
-                yield Static(self._get_cost_estimate(), id="cost-estimate")
+                # RIGHT COLUMN: Image Generation + Cost
+                with Vertical(classes="settings-column"):
+                    yield Static("Image Generation", classes="settings-section-title")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Enabled:", classes="settings-label")
+                        yield Switch(value=config.image_enabled, id="image-enabled-switch")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Model:", classes="settings-label")
+                        yield Select([(m, m) for m in IMAGE_MODELS], value=config.image_model,
+                                     id="image-model-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Quality:", classes="settings-label")
+                        yield Select([(q.capitalize(), q) for q in IMAGE_QUALITIES],
+                                     value=config.image_quality,
+                                     id="image-quality-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Style:", classes="settings-label")
+                        yield Select([(s.split(",")[0], s) for s in IMAGE_STYLES],
+                                     value=config.image_style,
+                                     id="image-style-select", classes="compact-select")
 
-            yield Button("Close", id="settings-close", variant="primary")
+                    # Local SD settings (only shown when local model selected)
+                    yield Static("Local SD Settings", classes="settings-section-title", id="local-sd-title")
+                    with Horizontal(classes="settings-row local-sd-row", id="local-resolution-row"):
+                        yield Static("Resolution:", classes="settings-label")
+                        yield Select([(r, r) for r in LOCAL_RESOLUTIONS],
+                                     value=config.local_resolution,
+                                     id="local-resolution-select", classes="compact-select")
+                    with Horizontal(classes="settings-row local-sd-row", id="local-guidance-row"):
+                        yield Static("Guidance:", classes="settings-label")
+                        yield Select([(g, g) for g in LOCAL_GUIDANCE],
+                                     value=config.local_guidance,
+                                     id="local-guidance-select", classes="compact-select")
+                    with Horizontal(classes="settings-row local-sd-row", id="local-negative-row"):
+                        yield Static("Negative:", classes="settings-label")
+                        yield Input(value=config.local_negative_prompt,
+                                    placeholder="blurry, bad anatomy...",
+                                    id="local-negative-input")
+                    with Horizontal(id="test-image-row"):
+                        yield Button("Test Image", id="test-image-btn")
+                        yield Static("", id="test-image-result")
+
+                    yield Static("Cost Estimate", classes="settings-section-title")
+                    yield Static(self._get_cost_estimate(), id="cost-estimate")
+
+            # Footer with close button
+            with Horizontal(id="settings-footer"):
+                yield Button("Close", id="settings-close", variant="primary")
 
     def _get_cost_estimate(self) -> str:
         """Calculate estimated cost per message based on current settings."""
@@ -378,7 +473,7 @@ class SettingsScreen(ModalScreen):
             "gpt-3.5-turbo": (0.50, 1.50),
         }
 
-        # TTS pricing per 1M characters
+        # TTS pricing per 1M characters (Edge is free!)
         tts_prices = {"tts-1": 15.0, "tts-1-hd": 30.0, "gpt-4o-mini-tts": 12.0}
 
         # Estimated tokens per call (approximations)
@@ -390,22 +485,51 @@ class SettingsScreen(ModalScreen):
         narrator_in, narrator_out = llm_prices.get(config.narrator_model, (0.15, 0.60))
         interp_in, interp_out = llm_prices.get(config.interpreter_model, (0.15, 0.60))
         suggest_in, suggest_out = llm_prices.get(config.suggestions_model, (0.15, 0.60))
-        tts_price = tts_prices.get(config.tts_model, 15.0)
 
         # Per-message costs (in dollars)
         narrator_cost = (500 * narrator_in + 150 * narrator_out) / 1_000_000
         interp_cost = (300 * interp_in + 50 * interp_out) / 1_000_000
         suggest_cost = (200 * suggest_in + 50 * suggest_out) / 1_000_000
-        tts_cost = (500 * tts_price) / 1_000_000 if config.tts_enabled else 0
 
-        total = narrator_cost + interp_cost + suggest_cost + tts_cost
+        # TTS cost: Edge is free, OpenAI is paid
+        if not config.tts_enabled:
+            tts_cost = 0
+            tts_note = ""
+        elif config.tts_engine == "edge":
+            tts_cost = 0
+            tts_note = " (free)"
+        else:
+            tts_price = tts_prices.get(config.tts_model, 15.0)
+            tts_cost = (500 * tts_price) / 1_000_000
+            tts_note = ""
+
+        # Image generation cost per action
+        image_prices = {
+            "gpt-image-1-mini": {"low": 0.001, "medium": 0.003, "high": 0.013},
+            "gpt-image-1": {"low": 0.01, "medium": 0.04, "high": 0.17},
+            "dall-e-3": {"low": 0.04, "medium": 0.08, "high": 0.12},
+            "dall-e-2": {"low": 0.02, "medium": 0.02, "high": 0.02},
+        }
+        if not config.image_enabled:
+            image_cost = 0
+            image_note = ""
+        elif "local" in config.image_model.lower():
+            image_cost = 0
+            image_note = " (free)"
+        else:
+            model_prices = image_prices.get(config.image_model, {"low": 0.01})
+            image_cost = model_prices.get(config.image_quality, 0.01)
+            image_note = ""
+
+        total = narrator_cost + interp_cost + suggest_cost + tts_cost + image_cost
 
         return (
             f"[dim]Est. per action: [#0f9]${total:.4f}[/]\n"
             f"  Narrator: ${narrator_cost:.5f}\n"
             f"  Interpreter: ${interp_cost:.5f}\n"
             f"  Suggestions: ${suggest_cost:.5f}\n"
-            f"  TTS: ${tts_cost:.5f}[/]"
+            f"  TTS: ${tts_cost:.5f}{tts_note}\n"
+            f"  Image: ${image_cost:.2f}{image_note}[/]"
         )
 
     def _update_cost_estimate(self) -> None:
@@ -435,18 +559,86 @@ class SettingsScreen(ModalScreen):
         elif select_id == "suggestions-model-select":
             config.suggestions_model = value
             self._update_cost_estimate()
+        elif select_id == "tts-engine-select":
+            config.tts_engine = value
+            self._update_voice_options()
+            self._update_model_row_visibility()
+            self._update_cost_estimate()
         elif select_id == "tts-model-select":
             config.tts_model = value
             self._update_cost_estimate()
         elif select_id == "tts-voice-select":
             tts = get_tts()
             tts.set_voice(value)
+        elif select_id == "image-model-select":
+            config.image_model = value
+            self._update_local_sd_visibility()
+            self._update_cost_estimate()
+        elif select_id == "image-quality-select":
+            config.image_quality = value
+            self._update_cost_estimate()
+        elif select_id == "image-style-select":
+            config.image_style = value
+        elif select_id == "local-resolution-select":
+            config.local_resolution = value
+        elif select_id == "local-guidance-select":
+            config.local_guidance = value
+
+    def _update_voice_options(self) -> None:
+        """Update the voice dropdown options based on the selected engine."""
+        config = get_config()
+        voice_select = self.query_one("#tts-voice-select", Select)
+
+        if config.tts_engine == "edge":
+            voice_options = [(v.split("-")[2].replace("Neural", ""), v) for v in EDGE_VOICES]
+            current_voice = config.edge_voice
+        else:
+            voice_options = [(v.capitalize(), v) for v in TTS_VOICES]
+            current_voice = config.tts_voice
+
+        voice_select.set_options(voice_options)
+        voice_select.value = current_voice
+
+    def _update_model_row_visibility(self) -> None:
+        """Show/hide the TTS model row based on engine (only OpenAI has models)."""
+        config = get_config()
+        try:
+            model_row = self.query_one("#tts-model-row", Horizontal)
+            if config.tts_engine == "edge":
+                model_row.display = False
+            else:
+                model_row.display = True
+        except:
+            pass
+
+    def _update_local_sd_visibility(self) -> None:
+        """Show/hide local SD settings based on whether a local model is selected."""
+        config = get_config()
+        show_local = is_local_model(config.image_model)
+        try:
+            self.query_one("#local-sd-title", Static).display = show_local
+            self.query_one("#local-resolution-row", Horizontal).display = show_local
+            self.query_one("#local-guidance-row", Horizontal).display = show_local
+            self.query_one("#local-negative-row", Horizontal).display = show_local
+            self.query_one("#test-image-row", Horizontal).display = show_local
+        except:
+            pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Handle input field changes."""
+        if event.input.id == "local-negative-input":
+            config = get_config()
+            config.local_negative_prompt = event.value
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         """Handle switch changes."""
         if event.switch.id == "tts-enabled-switch":
             tts = get_tts()
             tts.set_enabled(event.value)
+            self._update_cost_estimate()
+        elif event.switch.id == "image-enabled-switch":
+            config = get_config()
+            config.image_enabled = event.value
             self._update_cost_estimate()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -463,6 +655,76 @@ class SettingsScreen(ModalScreen):
             tts = get_tts()
             new_rate = tts.adjust_speed(25)
             self.query_one("#tts-speed-display", Static).update(str(new_rate))
+        elif button_id == "test-image-btn":
+            self.app.run_worker(self._run_test_image(), exclusive=False)
+
+    async def _run_test_image(self) -> None:
+        """Run a test image generation and display timing."""
+        config = get_config()
+        result_label = self.query_one("#test-image-result", Static)
+        test_btn = self.query_one("#test-image-btn", Button)
+
+        # Disable button during generation
+        test_btn.disabled = True
+
+        # Get settings
+        quality = config.image_quality
+        resolution = config.local_resolution
+        guidance = config.local_guidance
+        negative = config.local_negative_prompt
+
+        # Get total steps for progress display
+        steps_map = {"low": 10, "medium": 20, "high": 35}
+        total_steps = steps_map.get(quality, 15)
+        time_per_step = 0.5  # Estimate
+
+        # Progress tracking
+        progress_state = {"step": 0}
+
+        def update_progress(step, _total):
+            progress_state["step"] = step
+
+        # Progress updater task
+        async def progress_updater():
+            while progress_state["step"] < total_steps:
+                step = progress_state["step"]
+                remaining = total_steps - step
+                est_remaining = int(remaining * time_per_step)
+                bar_width = 10
+                filled = int((step / total_steps) * bar_width) if total_steps > 0 else 0
+                bar = "█" * filled + "░" * (bar_width - filled)
+                result_label.update(f"[dim]{bar} {step}/{total_steps} (~{est_remaining}s)[/]")
+                await asyncio.sleep(0.3)
+
+        progress_task = asyncio.create_task(progress_updater())
+
+        # Run generation in thread pool
+        loop = asyncio.get_event_loop()
+        image_data, elapsed = await loop.run_in_executor(
+            None,
+            lambda: generate_test_image(
+                quality=quality,
+                local_resolution=resolution,
+                local_guidance=guidance,
+                local_negative_prompt=negative,
+                progress_callback=update_progress
+            )
+        )
+
+        # Cancel progress updater
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+
+        # Show result
+        if image_data:
+            result_label.update(f"[#0f9]✓ {elapsed:.1f}s[/] [dim]({len(image_data)//1024}KB)[/]")
+        else:
+            result_label.update("[#f00]✗ Failed[/]")
+
+        test_btn.disabled = False
 
     def action_close_settings(self) -> None:
         """Close settings screen."""
@@ -493,12 +755,43 @@ class RPGApp(App):
         margin-bottom: 1;
     }
 
-    #story-scroll {
+    #story-row {
         height: 1fr;
+        margin-bottom: 1;
+    }
+
+    #story-scroll {
+        width: 2fr;
+        height: 100%;
         border: round #0f9;
         background: #0f0f23;
         padding: 1 2;
-        margin-bottom: 1;
+    }
+
+    #image-container {
+        width: 1fr;
+        min-width: 30;
+        max-width: 50;
+        height: 100%;
+        border: round #0af;
+        background: #0f0f23;
+        margin-left: 1;
+        align: center middle;
+        overflow: hidden;
+    }
+
+    #image-container.hidden {
+        display: none;
+    }
+
+    #image-placeholder {
+        text-align: center;
+        color: #444;
+    }
+
+    #scene-image {
+        width: 100%;
+        height: 100%;
     }
 
     #story-content {
@@ -570,23 +863,41 @@ class RPGApp(App):
     }
 
     #undo-btn {
-        background: #444;
-        color: #fff;
-        border: none;
+        height: 4;
+        background: #0f0f23;
+        color: #888;
+        border: round #444;
     }
 
     #undo-btn:hover {
-        background: #666;
+        background: #16213e;
+        border: round #0af;
+        color: #0af;
+    }
+
+    #undo-btn:focus {
+        background: #16213e;
+        border: round #0f9;
+        color: #0f9;
     }
 
     #force-btn {
-        background: #a00;
-        color: #fff;
-        border: none;
+        height: 4;
+        background: #300;
+        color: #f66;
+        border: round #a00;
     }
 
     #force-btn:hover {
-        background: #c00;
+        background: #400;
+        border: round #f00;
+        color: #fff;
+    }
+
+    #force-btn:focus {
+        background: #400;
+        border: round #f00;
+        color: #fff;
     }
 
     #force-btn.hidden {
@@ -594,17 +905,25 @@ class RPGApp(App):
     }
 
     #settings-btn {
-        width: 3;
-        min-width: 3;
-        height: 3;
-        background: #444;
-        color: #fff;
-        border: none;
+        width: 5;
+        min-width: 5;
+        height: 4;
+        background: #0f0f23;
+        color: #888;
+        border: round #444;
         padding: 0;
     }
 
     #settings-btn:hover {
-        background: #666;
+        background: #16213e;
+        border: round #0af;
+        color: #0af;
+    }
+
+    #settings-btn:focus {
+        background: #16213e;
+        border: round #0f9;
+        color: #0f9;
     }
 
     .dim {
@@ -833,6 +1152,64 @@ class RPGApp(App):
         color: #444;
         margin-top: 1;
     }
+
+    /* Title screen */
+    #title-screen {
+        width: 100%;
+        height: 100%;
+        align: center middle;
+    }
+
+    #title-screen.hidden {
+        display: none;
+    }
+
+    #title-container {
+        width: 60;
+        height: auto;
+        background: #0f0f23;
+        border: round #0f9;
+        padding: 3 4;
+        align: center middle;
+    }
+
+    #title-logo {
+        text-align: center;
+        text-style: bold;
+        color: #0f9;
+        margin-bottom: 2;
+    }
+
+    #title-status {
+        text-align: center;
+        color: #888;
+        height: 2;
+    }
+
+    #title-prompt {
+        text-align: center;
+        margin-top: 2;
+    }
+
+    #title-settings-btn {
+        margin-top: 2;
+        width: 20;
+        background: #16213e;
+        color: #888;
+        border: round #444;
+    }
+
+    #title-settings-btn:hover {
+        background: #1a1a2e;
+        border: round #0af;
+        color: #0af;
+    }
+
+    #title-settings-btn:focus {
+        background: #1a1a2e;
+        border: round #0f9;
+        color: #0f9;
+    }
     """
 
     BINDINGS = [
@@ -872,12 +1249,27 @@ class RPGApp(App):
 
         # Check if API key is already set
         existing_key = get_api_key()
-        if existing_key and init_openai_client(existing_key):
-            self.creation_phase = "name"  # Skip API key screen
-        else:
-            self.creation_phase = "apikey"  # "apikey", "name", "stats", "game"
+        self._has_api_key = existing_key and init_openai_client(existing_key)
+
+        # Always start at title screen
+        self.creation_phase = "title"  # "title", "apikey", "name", "stats", "game"
+        self._model_loading = False
+        self._model_ready = False
 
     def compose(self) -> ComposeResult:
+        # Title screen (shows while loading)
+        yield Center(
+            Container(
+                Static("UNIVERSAL RPG ENGINE", id="title-logo"),
+                Static("", id="title-status"),
+                Static("[dim]Press ENTER to start[/]", id="title-prompt"),
+                Button("⚙ Settings", id="title-settings-btn"),
+                id="title-container"
+            ),
+            id="title-screen",
+            classes="" if self.creation_phase == "title" else "hidden"
+        )
+
         # API Key entry screen
         yield Center(
             Container(
@@ -889,7 +1281,7 @@ class RPGApp(App):
                 id="apikey-container"
             ),
             id="apikey-screen",
-            classes="" if self.creation_phase == "apikey" else "hidden"
+            classes="hidden"
         )
 
         # Name entry screen
@@ -901,7 +1293,7 @@ class RPGApp(App):
                 id="name-container"
             ),
             id="name-screen",
-            classes="hidden" if self.creation_phase == "apikey" else ""
+            classes="hidden"
         )
 
         # Stat allocation screen (Fallout-style)
@@ -944,7 +1336,14 @@ class RPGApp(App):
         # Main game screen
         yield Vertical(
             Static("", id="stats-bar"),
-            ScrollableContainer(Static("", id="story-content"), id="story-scroll"),
+            Horizontal(
+                ScrollableContainer(Static("", id="story-content"), id="story-scroll"),
+                Container(
+                    Static("[dim]No image[/]", id="image-placeholder"),
+                    id="image-container"
+                ),
+                id="story-row"
+            ),
             Static("", id="roll-bar"),
             Horizontal(
                 TextArea(id="action-input"),
@@ -961,12 +1360,44 @@ class RPGApp(App):
         )
 
     def on_mount(self) -> None:
-        if self.creation_phase == "apikey":
+        if self.creation_phase == "title":
+            # Start preloading local model if configured
+            self.run_worker(self._preload_model_async(), exclusive=False)
+        elif self.creation_phase == "apikey":
             self.query_one("#apikey-input", Input).focus()
         else:
             self.query_one("#name-input", Input).focus()
             self._prompt_animation_task = self.run_worker(self._animate_name_prompt(), exclusive=False)
         self.update_stat_bars()
+
+    async def _preload_model_async(self) -> None:
+        """Preload the local SD model in the background if configured."""
+        config = get_config()
+        status = self.query_one("#title-status", Static)
+        prompt = self.query_one("#title-prompt", Static)
+
+        # Check if we're using a local model
+        if config.image_enabled and is_local_model(config.image_model):
+            self._model_loading = True
+            status.update("[#fa0]Loading local Stable Diffusion model...[/]")
+            prompt.update("[dim]Please wait...[/]")
+
+            # Run preloading in a thread pool
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, preload_local_model)
+
+            self._model_loading = False
+            self._model_ready = True
+            status.update("[#0f9]Model loaded![/]")
+            prompt.update("[dim]Press ENTER to start[/]")
+        else:
+            # No local model to load
+            self._model_ready = True
+            if config.image_enabled:
+                status.update(f"[dim]Using {config.image_model}[/]")
+            else:
+                status.update("[dim]Image generation disabled[/]")
+            prompt.update("[dim]Press ENTER to start[/]")
 
     async def _animate_name_prompt(self) -> None:
         """Glitchy cycling through identity questions on name screen."""
@@ -1052,41 +1483,52 @@ class RPGApp(App):
         # Start scrolling timer (faster scroll)
         self._scroll_timer = self.set_interval(0.15, self._scroll_suggestions)
 
+    def _wrap_text(self, text: str, width: int) -> str:
+        """Wrap text to fit within width, breaking at word boundaries."""
+        import textwrap
+        lines = textwrap.wrap(text, width=width, break_long_words=False, break_on_hyphens=True)
+        # Return exactly 2 lines, padding if needed
+        if len(lines) == 0:
+            return "\n"
+        elif len(lines) == 1:
+            return lines[0] + "\n"
+        else:
+            return lines[0] + "\n" + lines[1]
+
     def _scroll_suggestions(self) -> None:
-        """Scroll text in suggestion buttons, snaking across 2 rows."""
+        """Scroll text in suggestion buttons, snaking across 2 rows with word wrap."""
         for i, suggestion in enumerate(self.suggestions):
             try:
                 btn = self.query_one(f"#suggestion-{i + 1}", Button)
 
                 # Calculate max width based on button's actual size (subtract padding)
                 max_width = max(20, btn.size.width - 4)
-                # Total chars visible across 2 rows
-                total_visible = max_width * 2
 
-                if len(suggestion) <= total_visible:
-                    # Short enough to fit in 2 rows, no scrolling needed
-                    if len(suggestion) <= max_width:
-                        # Fits in one row
-                        display_text = suggestion
-                    else:
-                        # Split across 2 rows
-                        row1 = suggestion[:max_width]
-                        row2 = suggestion[max_width:max_width * 2]
-                        display_text = row1 + "\n" + row2
+                # Use textwrap to check if it fits in 2 lines
+                import textwrap
+                wrapped = textwrap.wrap(suggestion, width=max_width, break_long_words=False, break_on_hyphens=True)
+
+                if len(wrapped) <= 2:
+                    # Fits in 2 rows, no scrolling needed
+                    display_text = self._wrap_text(suggestion, max_width)
                 else:
-                    # Scroll the text across 2 rows
+                    # Need to scroll - show a sliding window
                     pos = self._scroll_positions[i]
-                    # Add spacing between end and start
-                    padded = suggestion + "   ...   "
-                    # Get visible portion (2 rows worth)
-                    extended = padded * 3  # Ensure enough chars
-                    visible = extended[pos:pos + total_visible]
-                    # Split into 2 rows
-                    row1 = visible[:max_width]
-                    row2 = visible[max_width:total_visible]
-                    display_text = row1 + "\n" + row2
+                    # Add separator between end and start
+                    padded = suggestion + "  ···  "
+                    padded_len = len(padded)
+
+                    # Create a sliding window view and wrap it
+                    extended = padded * 3
+                    # Take enough chars to potentially fill 2 lines
+                    window_size = max_width * 3  # Extra chars for word wrap flexibility
+                    window = extended[pos:pos + window_size]
+
+                    # Wrap the window and take first 2 lines
+                    display_text = self._wrap_text(window, max_width)
+
                     # Advance position
-                    self._scroll_positions[i] = (pos + 1) % len(padded)
+                    self._scroll_positions[i] = (pos + 1) % padded_len
 
                 btn.label = display_text
             except:
@@ -1147,6 +1589,14 @@ class RPGApp(App):
         self.query_one("#stat-screen").add_class("hidden")
         self.query_one("#main-container").remove_class("hidden")
 
+        # Show/hide image panel based on settings
+        config = get_config()
+        image_container = self.query_one("#image-container", Container)
+        if config.image_enabled and IMAGES_AVAILABLE:
+            image_container.remove_class("hidden")
+        else:
+            image_container.add_class("hidden")
+
         # Update game UI
         self.update_stats_bar()
         story = self.query_one("#story-content", Static)
@@ -1165,6 +1615,10 @@ class RPGApp(App):
         # Speak the opening scene (non-blocking, will be interrupted by first action)
         tts = get_tts()
         tts.speak(self.context, blocking=False, interrupt=True)
+
+        # Generate opening scene image if enabled
+        if config.image_enabled and IMAGES_AVAILABLE:
+            self.run_worker(self._generate_image_async(), exclusive=False)
 
         # Update cost display after LLM calls and TTS chars are added
         self.update_stats_bar()
@@ -1297,6 +1751,11 @@ class RPGApp(App):
         tts = get_tts()
         tts.speak(self.context, blocking=False, interrupt=True)
 
+        # Generate scene image if enabled
+        config = get_config()
+        if config.image_enabled and IMAGES_AVAILABLE:
+            self.run_worker(self._generate_image_async(), exclusive=False)
+
         # Update cost display (after TTS chars are added)
         self.update_stats_bar()
 
@@ -1315,9 +1774,188 @@ class RPGApp(App):
         container = self.query_one("#story-scroll", ScrollableContainer)
         container.scroll_end(animate=False)
 
+    async def _generate_image_async(self) -> None:
+        """Generate and display a scene image asynchronously in a background thread."""
+        logger.info("Starting image generation async")
+        config = get_config()
+
+        # Capture values for the thread (avoid accessing self in thread)
+        narrative = self.context
+        character = self.character
+        style = config.image_style
+        model = config.image_model
+        quality = config.image_quality
+        is_local = is_local_model(model)
+        logger.debug(f"Image gen params: model={model}, quality={quality}, is_local={is_local}")
+
+        # Get total steps for local model progress bar
+        steps_map = {"low": 10, "medium": 20, "high": 35}
+        total_steps = steps_map.get(quality, 15) if is_local else 0
+        # Approximate time per step (seconds) - adjust based on your GPU
+        time_per_step = 0.5  # ~0.5s per step on RTX 5050
+
+        # Show loading state - remove old image and show placeholder
+        try:
+            container = self.query_one("#image-container", Container)
+            # Remove old image if exists
+            try:
+                old_image = self.query_one("#scene-image")
+                old_image.remove()
+                logger.debug("Removed old scene image")
+            except:
+                pass
+            # Remove old placeholder if exists
+            try:
+                old_placeholder = self.query_one("#image-placeholder", Static)
+                old_placeholder.remove()
+                logger.debug("Removed old placeholder")
+            except:
+                pass
+            # Add new placeholder - show progress bar for local, simple text for API
+            if is_local:
+                est_time = int(total_steps * time_per_step)
+                container.mount(Static(f"[dim]Generating... 0/{total_steps} (~{est_time}s)[/]", id="image-placeholder"))
+            else:
+                container.mount(Static("[dim]Generating...[/]", id="image-placeholder"))
+            logger.debug("Mounted new placeholder")
+        except Exception as e:
+            logger.error(f"Failed to manage image container: {e}")
+
+        # Progress tracking for local models
+        progress_state = {"step": 0}
+
+        def update_progress(step, _total):
+            progress_state["step"] = step
+
+        # For local models, use a separate task to update progress
+        if is_local:
+            async def progress_updater():
+                while progress_state["step"] < total_steps:
+                    try:
+                        step = progress_state["step"]
+                        remaining = total_steps - step
+                        est_remaining = int(remaining * time_per_step)
+                        # Build progress bar: ████░░░░░░
+                        bar_width = 10
+                        filled = int((step / total_steps) * bar_width) if total_steps > 0 else 0
+                        bar = "█" * filled + "░" * (bar_width - filled)
+                        placeholder = self.query_one("#image-placeholder", Static)
+                        placeholder.update(f"[dim]{bar} {step}/{total_steps} (~{est_remaining}s)[/]")
+                    except:
+                        pass
+                    await asyncio.sleep(0.3)
+
+            progress_task = asyncio.create_task(progress_updater())
+
+        # Get local SD settings
+        local_resolution = config.local_resolution
+        local_guidance = config.local_guidance
+        local_negative = config.local_negative_prompt
+
+        # Run the blocking API call in a thread pool to not block the UI
+        loop = asyncio.get_event_loop()
+        image_data = await loop.run_in_executor(
+            None,  # Use default thread pool
+            lambda: generate_scene_image(
+                narrative=narrative,
+                character=character,
+                style=style,
+                client=client,
+                model=model,
+                quality=quality,
+                progress_callback=update_progress if is_local else None,
+                local_resolution=local_resolution,
+                local_guidance=local_guidance,
+                local_negative_prompt=local_negative,
+            )
+        )
+
+        # Cancel progress updater if running
+        if is_local:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info(f"Image generation returned: {len(image_data) if image_data else 0} bytes")
+
+        if image_data:
+            # Track the image generation
+            config.add_image()
+            self.update_stats_bar()
+
+            # Display the image
+            self._display_image(image_data)
+        else:
+            logger.warning("Image generation returned None")
+            try:
+                placeholder = self.query_one("#image-placeholder", Static)
+                placeholder.update("[dim]Image failed[/]")
+            except:
+                pass
+
+    def _display_image(self, image_data: bytes) -> None:
+        """Display an image in the image container."""
+        if not IMAGES_AVAILABLE:
+            return
+
+        try:
+            container = self.query_one("#image-container", Container)
+
+            # Remove old image/placeholder
+            try:
+                old_placeholder = self.query_one("#image-placeholder", Static)
+                old_placeholder.remove()
+            except:
+                pass
+            try:
+                old_image = self.query_one("#scene-image")
+                old_image.remove()
+            except:
+                pass
+
+            # Create image widget from bytes
+            from PIL import Image as PILImage
+            pil_image = PILImage.open(BytesIO(image_data))
+
+            # Mount the new image widget
+            image_widget = ImageWidget(pil_image, id="scene-image")
+            container.mount(image_widget)
+
+            logger.info("Scene image displayed successfully")
+        except Exception as e:
+            logger.error(f"Failed to display image: {e}")
+            # Show error in placeholder
+            try:
+                container = self.query_one("#image-container", Container)
+                container.mount(Static(f"[dim]Display error[/]", id="image-placeholder"))
+            except:
+                pass
+
     def on_key(self, event) -> None:
-        """Handle key presses for TextArea submission."""
-        # Submit on Enter
+        """Handle key presses for TextArea submission and title screen."""
+        # Handle title screen
+        if event.key == "enter" and self.creation_phase == "title":
+            # Don't proceed if model is still loading
+            if self._model_loading:
+                return
+            # Transition to next screen
+            self.query_one("#title-screen").add_class("hidden")
+            if self._has_api_key:
+                self.creation_phase = "name"
+                self.query_one("#name-screen").remove_class("hidden")
+                self.query_one("#name-input", Input).focus()
+                self._prompt_animation_task = self.run_worker(self._animate_name_prompt(), exclusive=False)
+            else:
+                self.creation_phase = "apikey"
+                self.query_one("#apikey-screen").remove_class("hidden")
+                self.query_one("#apikey-input", Input).focus()
+            event.prevent_default()
+            event.stop()
+            return
+
+        # Submit on Enter for game input
         if event.key == "enter":
             try:
                 input_widget = self.query_one("#action-input", TextArea)
@@ -1369,8 +2007,8 @@ class RPGApp(App):
         elif button_id == "suggestion-3":
             self.handle_action(self.suggestions[2])
 
-        # Settings button
-        elif button_id == "settings-btn":
+        # Settings button (game and title screen)
+        elif button_id == "settings-btn" or button_id == "title-settings-btn":
             self.action_open_settings()
 
     def action_undo(self) -> None:
@@ -1392,7 +2030,13 @@ class RPGApp(App):
 
     def action_open_settings(self) -> None:
         """Open settings screen."""
-        self.push_screen(SettingsScreen())
+        self.push_screen(SettingsScreen(), callback=self._on_settings_closed)
+
+    def _on_settings_closed(self, result=None) -> None:
+        """Called when settings screen closes. Refresh title screen if needed."""
+        if self.creation_phase == "title":
+            # Re-check if we need to load local model after settings change
+            self.run_worker(self._preload_model_async(), exclusive=False)
 
 
 if __name__ == "__main__":
