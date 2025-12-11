@@ -26,7 +26,14 @@
       "Bash(.venv/Scripts/python.exe:*)",
       "Bash(wmic:*)",
       "Bash(powershell:*)",
-      "Bash(c:UsersdavidprojectsRPGengine.venvScriptspython.exe:*)"
+      "Bash(c:UsersdavidprojectsRPGengine.venvScriptspython.exe:*)",
+      "Bash(c:/Users/david/projects/RPGengine/venv/Scripts/python.exe:*)",
+      "Bash(cmd /c \".venv\\Scripts\\pip.exe install rich-pixels\")",
+      "Bash(cmd /c \"dir /b c:\\Users\\david\\projects\\RPGengine\\.venv\\Scripts\")",
+      "Bash(powershell -Command \"& {.\\.venv\\Scripts\\pip.exe install rich-pixels}\")",
+      "Bash(py -m py_compile:*)",
+      "Bash(powershell -Command \"Get-Content ''c:\\Users\\david\\projects\\RPGengine\\rpg_engine.log'' -Tail 300 | Select-String -Pattern ''Image generation prompt:'' -Context 0,0\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\Users\\david\\projects\\RPGengine\\rpg_engine.log'' -Tail 500 | Select-String -Pattern ''Image generation prompt:'' -Context 0,0\")"
     ],
     "deny": [],
     "ask": []

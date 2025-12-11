@@ -56,13 +56,14 @@ TTS_VOICES = [
 # TTS engines available
 TTS_ENGINES = ["openai", "edge"]
 
-# Image generation models (sd-1.5 is local/free, gpt-image-1-mini is cheapest API)
-IMAGE_MODELS = ["sd-1.5 (local)", "gpt-image-1-mini", "gpt-image-1", "dall-e-3", "dall-e-2"]
+# Image generation models (local models are free, gpt-image-1-mini is cheapest API)
+IMAGE_MODELS = ["sdxl-turbo (local)", "sd-1.5 (local)", "gpt-image-1-mini", "gpt-image-1", "dall-e-3", "dall-e-2"]
 
 # Image quality options
 IMAGE_QUALITIES = ["low", "medium", "high"]
 
 # Local SD resolution options (width x height)
+# SDXL Turbo works best at 512x512, SD 1.5 at 512x512
 LOCAL_RESOLUTIONS = ["512x512", "512x768", "768x512", "768x768"]
 
 # Local SD guidance scale presets
@@ -99,6 +100,7 @@ DEFAULTS = {
     "narrator_model": "gpt-4o-mini",
     "interpreter_model": "gpt-4o-mini",
     "suggestions_model": "gpt-4o-mini",
+    "visual_director_model": "gpt-4o-mini",
     "tts_enabled": True,
     "tts_engine": "openai",  # "openai" or "edge"
     "tts_model": "tts-1",
@@ -129,6 +131,7 @@ class Config:
             "narrator": {"prompt": 0, "completion": 0},
             "interpreter": {"prompt": 0, "completion": 0},
             "suggestions": {"prompt": 0, "completion": 0},
+            "visual_director": {"prompt": 0, "completion": 0},
         }
         self._session_tts_chars = 0
         self._session_images = 0
@@ -191,6 +194,16 @@ class Config:
     @suggestions_model.setter
     def suggestions_model(self, value: str):
         self._settings["suggestions_model"] = value
+        self.save()
+
+    # Visual director model
+    @property
+    def visual_director_model(self) -> str:
+        return self._settings.get("visual_director_model", "gpt-4o-mini")
+
+    @visual_director_model.setter
+    def visual_director_model(self, value: str):
+        self._settings["visual_director_model"] = value
         self.save()
 
     # TTS enabled
@@ -394,6 +407,7 @@ class Config:
             "narrator": self.narrator_model,
             "interpreter": self.interpreter_model,
             "suggestions": self.suggestions_model,
+            "visual_director": self.visual_director_model,
         }
         for task, model in task_models.items():
             tokens = self._session_tokens[task]
@@ -436,6 +450,7 @@ class Config:
             "narrator": {"prompt": 0, "completion": 0},
             "interpreter": {"prompt": 0, "completion": 0},
             "suggestions": {"prompt": 0, "completion": 0},
+            "visual_director": {"prompt": 0, "completion": 0},
         }
         self._session_tts_chars = 0
         self._session_images = 0

@@ -1,6 +1,6 @@
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, ScrollableContainer, Container, Center
-from textual.widgets import Static, Input, Button, Select, Switch, TextArea
+from textual.widgets import Static, Input, Button, Select, Switch
 from textual.screen import ModalScreen
 from textual.binding import Binding
 from textual.reactive import reactive
@@ -12,27 +12,34 @@ import logging
 import asyncio
 from io import BytesIO
 from openai import OpenAI
-from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT
+from prompts import INTERPRETER_PROMPT, NARRATOR_PROMPT, SETUP_PROMPT, SUGGESTIONS_PROMPT, IMAGE_SUBJECT_PROMPT
 from tts import get_tts
 from config import get_config, LLM_MODELS, TTS_MODELS, TTS_VOICES, TTS_ENGINES, EDGE_VOICES, IMAGE_MODELS, IMAGE_QUALITIES, IMAGE_STYLES, LOCAL_RESOLUTIONS, LOCAL_GUIDANCE
-from image_gen import generate_scene_image, preload_local_model, is_local_model_ready, is_local_model, generate_test_image
+from image_gen import generate_scene_image, generate_visual_prompt, preload_local_model, is_local_model_ready, is_local_model, generate_test_image, get_last_error, clear_last_error
 
-# Try to import textual-image, fall back gracefully if not available
-# Note: textual-image has issues on Windows Terminal - we need to pre-fill the cell size cache
-# to avoid the terminal escape sequence timeout
+# Try to import textual-image for Sixel graphics (full resolution on Windows Terminal 1.22+)
+# Windows Terminal has issues with escape sequence detection - pre-fill the cache
 IMAGES_AVAILABLE = False
-ImageWidget = None
+SixelImage = None
+HalfcellImage = None
 try:
-    # Pre-fill the cell size cache to avoid timeout on Windows
+    # Pre-fill the cell size cache to avoid timeout on Windows Terminal
     from textual_image._terminal import get_cell_size, CellSize
     # Set a default cell size (10x20 is VT340 standard) to skip terminal detection
     setattr(get_cell_size, "_result", CellSize(10, 20))
 
-    # Now we can safely import the widget
-    from textual_image.widget import HalfcellImage as ImageWidget
+    # Now import the widgets
+    from textual_image.widget import SixelImage, HalfcellImage
     IMAGES_AVAILABLE = True
-except (ImportError, Exception) as e:
-    logging.warning(f"textual-image not available: {e}")
+except Exception as e:
+    SixelImage = None
+    HalfcellImage = None
+    # Fallback to rich-pixels if textual-image not available
+    try:
+        from rich_pixels import Pixels
+        IMAGES_AVAILABLE = True
+    except ImportError:
+        pass
 
 STAT_COLORS = {"mind": "#0af", "body": "#fa0", "spirit": "#f0a"}
 
@@ -234,11 +241,32 @@ class SettingsScreen(ModalScreen):
         padding: 1 2;
     }
 
+    #settings-header {
+        height: 3;
+        margin-bottom: 1;
+    }
+
+    #settings-back-btn {
+        width: 8;
+        min-width: 8;
+        height: 3;
+        background: #0f0f23;
+        color: #888;
+        border: round #444;
+    }
+
+    #settings-back-btn:hover {
+        background: #16213e;
+        border: round #0af;
+        color: #0af;
+    }
+
     #settings-title {
+        width: 1fr;
         text-align: center;
         text-style: bold;
         color: #0af;
-        margin-bottom: 1;
+        padding-top: 1;
     }
 
     #settings-columns {
@@ -362,7 +390,10 @@ class SettingsScreen(ModalScreen):
             current_voice = config.tts_voice
 
         with Container(id="settings-container"):
-            yield Static("⚙ SETTINGS", id="settings-title")
+            # Header with back button and title
+            with Horizontal(id="settings-header"):
+                yield Button("← Back", id="settings-back-btn")
+                yield Static("⚙ SETTINGS", id="settings-title")
 
             # Two-column layout
             with Horizontal(id="settings-columns"):
@@ -381,6 +412,10 @@ class SettingsScreen(ModalScreen):
                         yield Static("Suggestions:", classes="settings-label")
                         yield Select(llm_options, value=config.suggestions_model,
                                      id="suggestions-model-select", classes="compact-select")
+                    with Horizontal(classes="settings-row"):
+                        yield Static("Visual Dir:", classes="settings-label")
+                        yield Select(llm_options, value=config.visual_director_model,
+                                     id="visual-director-model-select", classes="compact-select")
 
                     yield Static("Text-to-Speech", classes="settings-section-title")
                     with Horizontal(classes="settings-row"):
@@ -485,11 +520,14 @@ class SettingsScreen(ModalScreen):
         narrator_in, narrator_out = llm_prices.get(config.narrator_model, (0.15, 0.60))
         interp_in, interp_out = llm_prices.get(config.interpreter_model, (0.15, 0.60))
         suggest_in, suggest_out = llm_prices.get(config.suggestions_model, (0.15, 0.60))
+        visual_in, visual_out = llm_prices.get(config.visual_director_model, (0.15, 0.60))
 
         # Per-message costs (in dollars)
         narrator_cost = (500 * narrator_in + 150 * narrator_out) / 1_000_000
         interp_cost = (300 * interp_in + 50 * interp_out) / 1_000_000
         suggest_cost = (200 * suggest_in + 50 * suggest_out) / 1_000_000
+        # Visual director: ~400 input (prompt + context), ~80 output (image prompt)
+        visual_cost = (400 * visual_in + 80 * visual_out) / 1_000_000 if config.image_enabled else 0
 
         # TTS cost: Edge is free, OpenAI is paid
         if not config.tts_enabled:
@@ -521,13 +559,17 @@ class SettingsScreen(ModalScreen):
             image_cost = model_prices.get(config.image_quality, 0.01)
             image_note = ""
 
-        total = narrator_cost + interp_cost + suggest_cost + tts_cost + image_cost
+        total = narrator_cost + interp_cost + suggest_cost + visual_cost + tts_cost + image_cost
+
+        # Visual director note
+        visual_note = "" if config.image_enabled else " (off)"
 
         return (
             f"[dim]Est. per action: [#0f9]${total:.4f}[/]\n"
             f"  Narrator: ${narrator_cost:.5f}\n"
             f"  Interpreter: ${interp_cost:.5f}\n"
             f"  Suggestions: ${suggest_cost:.5f}\n"
+            f"  Visual Dir: ${visual_cost:.5f}{visual_note}\n"
             f"  TTS: ${tts_cost:.5f}{tts_note}\n"
             f"  Image: ${image_cost:.2f}{image_note}[/]"
         )
@@ -558,6 +600,9 @@ class SettingsScreen(ModalScreen):
             self._update_cost_estimate()
         elif select_id == "suggestions-model-select":
             config.suggestions_model = value
+            self._update_cost_estimate()
+        elif select_id == "visual-director-model-select":
+            config.visual_director_model = value
             self._update_cost_estimate()
         elif select_id == "tts-engine-select":
             config.tts_engine = value
@@ -645,7 +690,7 @@ class SettingsScreen(ModalScreen):
         """Handle button presses."""
         button_id = event.button.id
 
-        if button_id == "settings-close":
+        if button_id == "settings-close" or button_id == "settings-back-btn":
             self.app.pop_screen()
         elif button_id == "settings-tts-slower":
             tts = get_tts()
@@ -668,15 +713,21 @@ class SettingsScreen(ModalScreen):
         test_btn.disabled = True
 
         # Get settings
+        model = config.image_model
         quality = config.image_quality
         resolution = config.local_resolution
         guidance = config.local_guidance
         negative = config.local_negative_prompt
 
-        # Get total steps for progress display
-        steps_map = {"low": 10, "medium": 20, "high": 35}
-        total_steps = steps_map.get(quality, 15)
-        time_per_step = 0.5  # Estimate
+        # Get total steps based on model type
+        is_turbo = "sdxl" in model.lower() or "turbo" in model.lower()
+        if is_turbo:
+            steps_map = {"low": 1, "medium": 2, "high": 4}
+            time_per_step = 2.0  # SDXL Turbo is slower per step but fewer steps
+        else:
+            steps_map = {"low": 10, "medium": 20, "high": 35}
+            time_per_step = 0.5
+        total_steps = steps_map.get(quality, 2 if is_turbo else 15)
 
         # Progress tracking
         progress_state = {"step": 0}
@@ -703,6 +754,7 @@ class SettingsScreen(ModalScreen):
         image_data, elapsed = await loop.run_in_executor(
             None,
             lambda: generate_test_image(
+                model=model,
                 quality=quality,
                 local_resolution=resolution,
                 local_guidance=guidance,
@@ -770,8 +822,8 @@ class RPGApp(App):
 
     #image-container {
         width: 1fr;
-        min-width: 30;
-        max-width: 50;
+        min-width: 40;
+        max-width: 80;
         height: 100%;
         border: round #0af;
         background: #0f0f23;
@@ -822,7 +874,7 @@ class RPGApp(App):
 
     #action-input {
         width: 1fr;
-        height: 4;
+        height: 3;
         background: #0f0f23;
         border: round #0f9;
         color: #fff;
@@ -1231,6 +1283,7 @@ class RPGApp(App):
     def __init__(self):
         super().__init__()
         self.character = ""
+        self.character_visual = ""  # Visual description for consistent image generation
         self.stats = {"mind": 3, "body": 3, "spirit": 3}
         self.context = ""
         self.history = []  # Stack of (context, roll_text) for undo
@@ -1255,6 +1308,7 @@ class RPGApp(App):
         self.creation_phase = "title"  # "title", "apikey", "name", "stats", "game"
         self._model_loading = False
         self._model_ready = False
+        self._game_starting = False  # Prevent multiple start_game calls
 
     def compose(self) -> ComposeResult:
         # Title screen (shows while loading)
@@ -1346,7 +1400,7 @@ class RPGApp(App):
             ),
             Static("", id="roll-bar"),
             Horizontal(
-                TextArea(id="action-input"),
+                Input(placeholder="Type anything...", id="action-input"),
                 Button("...", id="suggestion-1", classes="suggestion-btn"),
                 Button("...", id="suggestion-2", classes="suggestion-btn"),
                 Button("...", id="suggestion-3", classes="suggestion-btn"),
@@ -1575,6 +1629,24 @@ class RPGApp(App):
 
     def start_game(self) -> None:
         """Transition from stat allocation to the actual game."""
+        # Prevent multiple calls
+        if self._game_starting:
+            return
+        self._game_starting = True
+
+        # Disable the button and show loading state
+        try:
+            confirm_btn = self.query_one("#confirm-btn", Button)
+            confirm_btn.disabled = True
+            confirm_btn.label = "Starting..."
+        except Exception:
+            pass
+
+        # Run the actual game start in a worker
+        self.run_worker(self._start_game_async(), exclusive=True)
+
+    async def _start_game_async(self) -> None:
+        """Async game start to prevent UI blocking."""
         self.stats = {
             "mind": self.alloc_mind,
             "body": self.alloc_body,
@@ -1603,13 +1675,26 @@ class RPGApp(App):
         story.update("[dim]Generating your adventure...[/]")
         self.refresh()
 
-        # Generate opening scene
-        self.context = opening_scene(self.character, self.stats)
+        # Generate opening scene (run in executor to not block)
+        loop = asyncio.get_event_loop()
+        self.context = await loop.run_in_executor(
+            None, lambda: opening_scene(self.character, self.stats)
+        )
         story.update(self.context)
         self.scroll_story()
 
+        # Generate visual description for consistent images (if images enabled)
+        if config.image_enabled and IMAGES_AVAILABLE:
+            prompt = IMAGE_SUBJECT_PROMPT.format(character=self.character, scene=self.context)
+            self.character_visual = await loop.run_in_executor(
+                None, lambda: call_llm(prompt, task="interpreter")
+            )
+            logger.info(f"Character visual: {self.character_visual}")
+
         # Generate initial suggestions
-        suggestions = generate_suggestions(self.character, self.context)
+        suggestions = await loop.run_in_executor(
+            None, lambda: generate_suggestions(self.character, self.context)
+        )
         self.update_suggestions(suggestions)
 
         # Speak the opening scene (non-blocking, will be interrupted by first action)
@@ -1624,7 +1709,10 @@ class RPGApp(App):
         self.update_stats_bar()
 
         # Focus the action input
-        self.query_one("#action-input", TextArea).focus()
+        self.query_one("#action-input", Input).focus()
+
+        # Reset the starting flag (though we're now in game phase)
+        self._game_starting = False
 
     def handle_action(self, action: str) -> None:
         """Start the async action handler."""
@@ -1634,7 +1722,7 @@ class RPGApp(App):
         story = self.query_one("#story-content", Static)
         roll_bar = self.query_one("#roll-bar", Static)
         force_btn = self.query_one("#force-btn", Button)
-        input_widget = self.query_one("#action-input", TextArea)
+        input_widget = self.query_one("#action-input", Input)
         input_widget.disabled = True
 
         god_mode = False
@@ -1777,11 +1865,13 @@ class RPGApp(App):
     async def _generate_image_async(self) -> None:
         """Generate and display a scene image asynchronously in a background thread."""
         logger.info("Starting image generation async")
+        clear_last_error()  # Clear any previous error
         config = get_config()
 
         # Capture values for the thread (avoid accessing self in thread)
         narrative = self.context
-        character = self.character
+        # Use visual description if available, otherwise fall back to character name
+        character = self.character_visual if self.character_visual else self.character
         style = config.image_style
         model = config.image_model
         quality = config.image_quality
@@ -1794,7 +1884,7 @@ class RPGApp(App):
         # Approximate time per step (seconds) - adjust based on your GPU
         time_per_step = 0.5  # ~0.5s per step on RTX 5050
 
-        # Show loading state - remove old image and show placeholder
+        # Show loading state - remove old image and show/update placeholder
         try:
             container = self.query_one("#image-container", Container)
             # Remove old image if exists
@@ -1804,20 +1894,23 @@ class RPGApp(App):
                 logger.debug("Removed old scene image")
             except:
                 pass
-            # Remove old placeholder if exists
-            try:
-                old_placeholder = self.query_one("#image-placeholder", Static)
-                old_placeholder.remove()
-                logger.debug("Removed old placeholder")
-            except:
-                pass
-            # Add new placeholder - show progress bar for local, simple text for API
+
+            # Determine placeholder text
             if is_local:
                 est_time = int(total_steps * time_per_step)
-                container.mount(Static(f"[dim]Generating... 0/{total_steps} (~{est_time}s)[/]", id="image-placeholder"))
+                placeholder_text = f"[dim]Generating... 0/{total_steps} (~{est_time}s)[/]"
             else:
-                container.mount(Static("[dim]Generating...[/]", id="image-placeholder"))
-            logger.debug("Mounted new placeholder")
+                placeholder_text = "[dim]Generating...[/]"
+
+            # Try to update existing placeholder, or create new one
+            try:
+                old_placeholder = self.query_one("#image-placeholder", Static)
+                old_placeholder.update(placeholder_text)
+                logger.debug("Updated existing placeholder")
+            except:
+                # No placeholder exists, create one
+                container.mount(Static(placeholder_text, id="image-placeholder"))
+                logger.debug("Mounted new placeholder")
         except Exception as e:
             logger.error(f"Failed to manage image container: {e}")
 
@@ -1851,9 +1944,33 @@ class RPGApp(App):
         local_resolution = config.local_resolution
         local_guidance = config.local_guidance
         local_negative = config.local_negative_prompt
+        visual_director_model = config.visual_director_model
 
-        # Run the blocking API call in a thread pool to not block the UI
+        # Use visual director to generate optimized image prompt
+        # Extract recent narrative (last ~1500 chars for context)
+        recent_narrative = narrative[-1500:] if len(narrative) > 1500 else narrative
+
         loop = asyncio.get_event_loop()
+
+        # Generate optimized prompt using visual director
+        visual_prompt, vd_tokens = await loop.run_in_executor(
+            None,
+            lambda: generate_visual_prompt(
+                character_visual=character,
+                recent_narrative=recent_narrative,
+                style=style,
+                client=client,
+                model=visual_director_model,
+            )
+        )
+
+        # Track visual director tokens
+        if vd_tokens["prompt"] > 0 or vd_tokens["completion"] > 0:
+            config.add_tokens(vd_tokens["prompt"], vd_tokens["completion"], task="visual_director")
+
+        logger.info(f"Visual director prompt: {visual_prompt[:100]}...")
+
+        # Run the blocking image generation in a thread pool
         image_data = await loop.run_in_executor(
             None,  # Use default thread pool
             lambda: generate_scene_image(
@@ -1867,6 +1984,7 @@ class RPGApp(App):
                 local_resolution=local_resolution,
                 local_guidance=local_guidance,
                 local_negative_prompt=local_negative,
+                visual_prompt=visual_prompt,  # Pass optimized prompt from visual director
             )
         )
 
@@ -1891,12 +2009,16 @@ class RPGApp(App):
             logger.warning("Image generation returned None")
             try:
                 placeholder = self.query_one("#image-placeholder", Static)
-                placeholder.update("[dim]Image failed[/]")
+                error_msg = get_last_error()
+                if error_msg:
+                    placeholder.update(f"[red]Failed: {error_msg}[/]")
+                else:
+                    placeholder.update("[dim]Image failed[/]")
             except:
                 pass
 
     def _display_image(self, image_data: bytes) -> None:
-        """Display an image in the image container."""
+        """Display an image using Sixel (full resolution) or fallback to rich-pixels."""
         if not IMAGES_AVAILABLE:
             return
 
@@ -1915,15 +2037,35 @@ class RPGApp(App):
             except:
                 pass
 
-            # Create image widget from bytes
+            # Create image from bytes
             from PIL import Image as PILImage
             pil_image = PILImage.open(BytesIO(image_data))
 
-            # Mount the new image widget
-            image_widget = ImageWidget(pil_image, id="scene-image")
-            container.mount(image_widget)
+            # Try to use SixelImage for full-resolution display (Windows Terminal 1.22+)
+            if SixelImage is not None:
+                # SixelImage handles its own sizing - pass the PIL image directly
+                image_widget = SixelImage(pil_image, id="scene-image")
+                container.mount(image_widget)
+                logger.info("Scene image displayed successfully with Sixel (full resolution)")
+            else:
+                # Fallback to rich-pixels (lower resolution but universal)
+                from rich_pixels import Pixels
 
-            logger.info("Scene image displayed successfully")
+                # Get container size in characters (account for border/padding)
+                container_width = (container.size.width - 4) or 60
+                container_height = ((container.size.height - 2) or 30) * 2
+
+                # Scale image to fit container while maintaining aspect ratio
+                img_width, img_height = pil_image.size
+                scale = min(container_width / img_width, container_height / img_height)
+                new_width = max(1, int(img_width * scale))
+                new_height = max(1, int(img_height * scale))
+
+                pixels = Pixels.from_image(pil_image, resize=(new_width, new_height))
+                image_static = Static(pixels, id="scene-image")
+                container.mount(image_static)
+                logger.info("Scene image displayed with rich-pixels fallback")
+
         except Exception as e:
             logger.error(f"Failed to display image: {e}")
             # Show error in placeholder
@@ -1955,14 +2097,28 @@ class RPGApp(App):
             event.stop()
             return
 
+        # Handle stat screen - Enter to begin adventure
+        if event.key == "enter" and self.creation_phase == "stats":
+            # Don't proceed if already starting
+            if self._game_starting:
+                event.prevent_default()
+                event.stop()
+                return
+            remaining = 9 - (self.alloc_mind + self.alloc_body + self.alloc_spirit)
+            if remaining == 0:
+                self.start_game()
+                event.prevent_default()
+                event.stop()
+            return
+
         # Submit on Enter for game input
         if event.key == "enter":
             try:
-                input_widget = self.query_one("#action-input", TextArea)
+                input_widget = self.query_one("#action-input", Input)
                 if input_widget.has_focus:
-                    action = input_widget.text.strip()
+                    action = input_widget.value.strip()
                     if action and self.alive and self.game_started:
-                        input_widget.text = ""
+                        input_widget.value = ""
                         self.handle_action(action)
                         event.prevent_default()
                         event.stop()
@@ -1988,6 +2144,8 @@ class RPGApp(App):
 
         # Confirm button - start the game
         elif button_id == "confirm-btn":
+            if self._game_starting:
+                return  # Already starting, ignore
             remaining = 9 - (self.alloc_mind + self.alloc_body + self.alloc_spirit)
             if remaining == 0:
                 self.start_game()

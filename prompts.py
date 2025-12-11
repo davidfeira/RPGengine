@@ -164,3 +164,61 @@ Generate exactly 3 suggestions that are:
 
 Respond with valid JSON containing a "suggestions" key with an array of exactly 3 strings.
 Example: {{"suggestions": ["Approach cautiously with weapon ready", "Call out and offer to talk", "Search for another way around"]}}"""
+
+
+IMAGE_SUBJECT_PROMPT = """Given a character concept and their opening scene, generate a brief visual description for image generation.
+
+Character concept: {character}
+Opening scene: {scene}
+
+Create a SHORT (20-35 words max) visual description that captures:
+- What the character physically looks like (species, body type, age, distinguishing features)
+- Key visual traits (clothing style, colors, notable items they'd carry)
+- Details that fit the established setting/era from the scene
+
+DO NOT include:
+- Setting or background details (those change per scene)
+- Actions or poses
+- Personality traits or emotions
+- Abstract concepts
+
+Be SPECIFIC and VISUAL. Invent concrete details that fit the character concept.
+
+Examples:
+- "a dog" + park scene → "a scruffy golden retriever with warm brown eyes, a red bandana collar, and muddy paws"
+- "a ninja" + feudal Japan → "a lean Japanese man in dark indigo shinobi shozoku, face half-masked, with a tanto at his belt"
+- "queen of england" + palace scene → "an elegant older woman with silver hair in an updo, wearing a blue silk gown and pearl necklace"
+
+Respond with ONLY the visual description, no quotes or explanation."""
+
+
+VISUAL_DIRECTOR_PROMPT = """You are a cinematographer for an illustrated RPG, creating dynamic scene compositions.
+
+Character: {character_visual}
+Art style: {style}
+
+Story context:
+{recent_narrative}
+
+Generate a 40-60 word image prompt following these rules:
+
+COMPOSITION (pick one based on action intensity):
+- Wide shot: Environment dominates, character smaller in frame (for establishing scenes, travel)
+- Medium shot: Character and surroundings balanced (for dialogue, investigation)
+- Action shot: Dynamic angle with motion blur, debris, dramatic lighting (for combat, chases)
+- Close-up: Character detail, blurred background (for emotional moments)
+
+STRUCTURE YOUR PROMPT AS:
+1. SETTING first (location, time of day, weather, lighting direction)
+2. CAMERA ANGLE (low angle=heroic, high angle=vulnerable, Dutch tilt=tension)
+3. CHARACTER ACTION (use dynamic verbs: charging, crouching, leaping, reaching - NEVER "standing")
+4. Key props, particles, atmosphere (dust, sparks, mist, shadows)
+
+CRITICAL:
+- Lead with environment/setting, NOT the character description
+- The character should be DOING something dynamic, not posing
+- Include dramatic lighting (backlit, rim lighting, dramatic shadows)
+- Add movement elements (flowing cape, swirling dust, flying debris)
+- Output plain text only - NO markdown, NO asterisks, NO formatting
+
+Output ONLY the image prompt as plain text."""
